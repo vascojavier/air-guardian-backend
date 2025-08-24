@@ -9,8 +9,10 @@ import { getRemotePlaneIcon } from '../utils/getRemotePlaneIcon';
 import { normalizeModelToIcon } from '../utils/normalizeModelToIcon';
 import TrafficWarningCard from './components/TrafficWarningCard';
 import { Plane } from '../types/Plane';
-import { SERVER_URL } from '../utils/config'; // ajustá la ruta si es distinta
-import io from "socket.io-client";
+
+
+
+const SERVER_URL = 'https://miappsemaforo-backend-44ded92061ec.herokuapp.com';
 
 
 
@@ -47,8 +49,7 @@ const Radar = () => {
   const [selected, setSelected] = useState<Plane | null>(null);
   const [conflict, setConflict] = useState<Plane | null>(null);
   const [followMe, setFollowMe] = useState(true);
-  const hideSelectedTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
-
+  const hideSelectedTimeout = useRef<NodeJS.Timeout | null>(null);
   const [zoom, setZoom] = useState({ latitudeDelta: 0.1, longitudeDelta: 0.1 });
   const [myPlane, setMyPlane] = useState<Plane>({
     id: 'ME',
@@ -63,76 +64,10 @@ const Radar = () => {
   const [traffic, setTraffic] = useState<Plane[]>([]);
   const mapRef = useRef<MapView | null>(null);
 
- const socketRef = useRef<ReturnType<typeof io> | null>(null);
-
-
-useEffect(() => {
-  const socket = io(SERVER_URL, {
-    transports: ['websocket'],
-    query: { name: username }
-  });
-
-  socketRef.current = socket;
-
-  socket.on('connect', () => {
-    console.log('🔌 Conectado al servidor WebSocket');
-  });
-
-  socket.on('traffic-update', (data: any) => {
-    // Podés reemplazar esta lógica si el backend te manda otra estructura
-    if (Array.isArray(data)) {
-      setTraffic(data.map((info: any) => ({
-        id: info.name,
-        name: info.name,
-        lat: info.lat,
-        lon: info.lon,
-        alt: info.alt,
-        heading: info.heading,
-        speed: info.speed,
-        type: info.type,
-        callsign: info.callsign,
-        aircraftIcon: info.aircraftIcon || '2.png',
-      })));
-    }
-  });
-
-  socket.on('warning', (warning: any) => {
-    console.log('🚨 Warning recibido vía WebSocket:', warning);
-    setConflict({
-      id: warning.from,
-      name: warning.from,
-      lat: 0,
-      lon: 0,
-      alt: 0,
-      heading: 0,
-      speed: 0,
-      alertLevel: warning.type === 'RA' ? 'RA_LOW' : 'TA',
-    });
-  });
-
-  socket.on('disconnect', () => {
-    console.log('🔌 Desconectado del WebSocket');
-  });
-
-  return () => {
-    socket.disconnect();
-    socketRef.current = null;
-  };
-}, [username]);
-
-
-
-
-
-
-
-
   const toggleFollowMe = () => setFollowMe(prev => !prev);
-const hasWarning =
-  selected?.alertLevel === 'RA_HIGH' ||
-  selected?.alertLevel === 'RA_LOW' ||
-  selected?.alertLevel === 'TA';
-
+ const hasWarning =
+  Boolean(conflict) ||
+  (selected instanceof Object && conflict instanceof Object && selected.id !== conflict.id);
 
 const getDistanceTo = (plane: Plane): number => {
   if (
@@ -165,35 +100,14 @@ const getDistanceTo = (plane: Plane): number => {
           
           aircraftIcon: info.aircraftIcon || '2.png', // ✅
         })));
-
-        if (data.warnings && data.warnings.length > 0) {
-        const warning = data.warnings[0]; // podés hacer un loop si querés varios
-        console.log('🛑 Warning recibido del backend:', warning);
-
-    // Opcional: marcar el avión en conflicto aunque no lo hayas detectado localmente
-    setConflict({
-      id: warning.from,
-      name: warning.from,
-      lat: 0, // opcional: si no tenés la posición exacta
-      lon: 0,
-      alt: 0,
-      heading: 0,
-      speed: 0,
-      alertLevel: warning.type === 'RA' ? 'RA_LOW' : 'TA', // ajustar si querés usar RA_HIGH también
-      });
-    }
-
       } catch (err) {
         console.error('Error al obtener tráfico:', err);
       }
       
       
-    }, 500);// cada 1/2 segundo
-
+    }, 4000);
     return () => clearInterval(interval);
-
   }, [username]);
-
 
   useEffect(() => {
     if (!simMode) {
@@ -278,178 +192,28 @@ const getDistanceTo = (plane: Plane): number => {
     }
   }, [simMode, username, aircraftModel]);
 
-useEffect(() => {
-  if (!myPlane || traffic.length === 0) return;
-
-  const coneAngle = 25; // grados desde el heading
-  const timeSteps = Array.from({ length: 36 }, (_, i) => (i + 1) * 5); // [5, 10, ..., 180]
-  let selectedConflict: Plane | null = null;
-  let selectedConflictLevel: 'RA_HIGH' | 'RA_LOW' | undefined = undefined;
-
-  let selectedNearby: Plane | null = null;
-  let minTimeToImpact = Infinity;
-  let minProxDist = Infinity;
-
-  const toRad = (deg: number) => (deg * Math.PI) / 180;
-  const toDeg = (rad: number) => (rad * 180) / Math.PI;
-
-  const angleBetween = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-    const dLon = toRad(lon2 - lon1);
-    const y = Math.sin(dLon) * Math.cos(toRad(lat2));
-    const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
-              Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
-    const brng = Math.atan2(y, x);
-    return (toDeg(brng) + 360) % 360;
-  };
-
-  const angleDiff = (a: number, b: number) => {
-    const d = Math.abs(a - b) % 360;
-    return d > 180 ? 360 - d : d;
-  };
-
-  for (const plane of traffic) {
-    if (plane.id === myPlane.id) continue;
-
-    // TA (tráfico cercano)
-    const distanceNow = getDistance(myPlane.lat, myPlane.lon, plane.lat, plane.lon);
-    if (distanceNow < 3000 && plane.speed > 30) {
-      if (distanceNow < minProxDist) {
-        selectedNearby = plane;
-        minProxDist = distanceNow;
-      }
-    }
-
-    // RA (trayectorias convergentes dentro del cono)
-    for (const t of timeSteps) {
-      const myFuture = getFuturePosition(myPlane.lat, myPlane.lon, myPlane.heading, myPlane.speed, t);
-      const theirFuture = getFuturePosition(plane.lat, plane.lon, plane.heading || 0, plane.speed || 0, t);
-      const futureDistance = getDistance(myFuture.latitude, myFuture.longitude, theirFuture.latitude, theirFuture.longitude);
-      const futureAltDelta = Math.abs(myPlane.alt - plane.alt);
-
-      if (futureDistance < 1500 && futureAltDelta < 300) {
-        const bearing = angleBetween(myFuture.latitude, myFuture.longitude, theirFuture.latitude, theirFuture.longitude);
-        const diff = angleDiff(myPlane.heading, bearing);
-
-        if (diff < coneAngle) {
-          // Clasificamos por tiempo
-          if (t < 60 && t < minTimeToImpact) {
-            selectedConflict = plane;
-            selectedConflictLevel = 'RA_HIGH';
-            minTimeToImpact = t;
-          } else if (t < 180 && selectedConflictLevel !== 'RA_HIGH') {
-            selectedConflict = plane;
-            selectedConflictLevel = 'RA_LOW';
-            minTimeToImpact = t;
-          }
-          break;
+  useEffect(() => {
+    if (!myPlane || traffic.length === 0) return;
+    let closest: Plane | null = null;
+    let minDist = Infinity;
+    const myFuture = getFuturePosition(myPlane.lat, myPlane.lon, myPlane.heading, myPlane.speed, 60);
+    for (const plane of traffic) {
+      if (plane.id === myPlane.id) continue;
+      const theirFuture = getFuturePosition(plane.lat, plane.lon, plane.heading || 0, plane.speed || 0, 60);
+      const distNow = getDistance(myPlane.lat, myPlane.lon, plane.lat, plane.lon);
+      const distFuture = getDistance(myFuture.latitude, myFuture.longitude, theirFuture.latitude, theirFuture.longitude);
+      const deltaAlt = Math.abs(plane.alt - myPlane.alt);
+      if (distNow <= 8000 && deltaAlt <= 300 && (distFuture < distNow || distFuture < 5000)) {
+        if (distNow < minDist) {
+          closest = plane;
+          minDist = distNow;
         }
       }
     }
-  }
-
-  setConflict(
-    selectedConflict && selectedConflictLevel
-      ? {
-          ...selectedConflict,
-          alertLevel: selectedConflictLevel,
-          timeToImpact: minTimeToImpact,
-        }
-      : null
-  );
-
-
-
-  if (selectedConflict && selectedConflictLevel) {
-    setSelected({
-      ...selectedConflict,
-      alertLevel: selectedConflictLevel,
-      timeToImpact: minTimeToImpact,
-    });
-  } else if (selectedNearby) {
-    setSelected({ ...selectedNearby, alertLevel: 'TA' });
-  } else {
-    setSelected(null);
-  }
-
-  // Enviar warning al backend solo si hay conflicto real
-if (selectedConflict && selectedConflictLevel) {
-  const warningToSend = {
-    from: username, // tu callsign o nombre de avión
-    to: selectedConflict.name, // el nombre del avión en conflicto
-    type: selectedConflictLevel.startsWith('RA') ? 'RA' : 'TA',
-    distance: minProxDist || 0,
-    bearing: angleBetween(myPlane.lat, myPlane.lon, selectedConflict.lat, selectedConflict.lon),
-    verticalSeparation: myPlane.alt - selectedConflict.alt
-  };
-
-  fetch(`${SERVER_URL}/air-guardian/warning`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(warningToSend)
-  }).catch(err => console.warn('⚠️ Error al enviar warning:', err));
-}
-
-
-  function isNearby(a: Plane, b: Plane): boolean {
-  const dx = a.lat - b.lat;
-  const dy = a.lon - b.lon;
-  const dz = (a.alt || 0) - (b.alt || 0);
-
-  const horizontalDistance = Math.sqrt(dx * dx + dy * dy) * 111000; // 1° ≈ 111 km
-  const verticalDistance = Math.abs(dz);
-
-  return horizontalDistance < 2000 && verticalDistance < 300; // ejemplo: 2 km horizontal y 300 ft vertical
-}
-
-  const otherDetectsMeAsNearby = traffic.find((plane) =>
-  selected?.id &&
-  plane.id !== selected.id &&
-  isNearby(plane, selected) // El otro me detecta como cercano
-);
-
-
-const updatedTraffic = traffic.map((plane) => {
-  const isConflict =
-    selectedConflict &&
-    (plane.id === selectedConflict.id || plane.id === selected?.id);
-
-  const isNearby =
-    (selectedNearby &&
-      (plane.id === selectedNearby.id || plane.id === selected?.id)) ||
-    (otherDetectsMeAsNearby && plane.id === selected?.id);
-
-  if (isConflict) {
-    return {
-      ...plane,
-      alertLevel: selectedConflictLevel as 'RA_LOW' | 'RA_HIGH',
-    };
-  } else if (isNearby) {
-    return {
-      ...plane,
-      alertLevel: 'TA' as const,
-    };
-  } else {
-    return {
-      ...plane,
-      alertLevel: 'none' as const,
-    };
-  }
-});
-
-
-
-const isEqual = JSON.stringify(updatedTraffic) === JSON.stringify(traffic);
-if (!isEqual) {
-  setTraffic(updatedTraffic);
-}
-
-
-
-  
-
-}, [myPlane, traffic]);
-
-
+    setConflict(closest);
+    if (!closest && selected?.id === conflict?.id) setSelected(null);
+    if (!selected && closest) setSelected(closest);
+  }, [myPlane, traffic, selected]);
 
   const centerMap = (lat = myPlane.lat, lon = myPlane.lon) => {
     if (mapRef.current) {
@@ -503,40 +267,35 @@ if (!isEqual) {
 
         </Marker>
 
-{traffic.map((plane) => {
-  console.log('plane', plane.id, 'alertLevel', plane.alertLevel); // 👈 AGREGALO ACÁ
+        {traffic.map((plane) => (
+          <Marker
+            key={plane.id}
+            coordinate={{ latitude: plane.lat, longitude: plane.lon }}
+            anchor={{ x: 0.5, y: 0.5 }}
+            rotation={plane.heading}
+            flat
+          onPress={() => {
+            setSelected(plane);
 
-  return (
-    <Marker
-      key={plane.id}
-      coordinate={{ latitude: plane.lat, longitude: plane.lon }}
-      anchor={{ x: 0.5, y: 0.5 }}
-      rotation={plane.heading}
-      flat
-      onPress={() => {
-        setSelected(plane);
+            if (hideSelectedTimeout.current) {
+              clearTimeout(hideSelectedTimeout.current);
+            }
 
-        if (hideSelectedTimeout.current) {
-          clearTimeout(hideSelectedTimeout.current);
-        }
+            hideSelectedTimeout.current = setTimeout(() => {
+              setSelected(null);
+            }, 6000); // oculta luego de 6 segundos
+          }}
 
-        hideSelectedTimeout.current = setTimeout(() => {
-          setSelected(null);
-        }, 6000);
-      }}
-    >
-      <Image
-        source={getRemotePlaneIcon(
-          plane.aircraftIcon || plane.type || '2.png',
-          plane.alertLevel
-        )}
-        style={{ width: 30, height: 30 }}
-        resizeMode="contain"
-      />
-    </Marker>
-  );
-})}
+          >
+        <Image
+          source={getRemotePlaneIcon(plane.aircraftIcon || plane.type || '2.png', conflict?.id === plane.id)}
+          style={{ width: 30, height: 30 }}
+          resizeMode="contain"
+        />
 
+
+          </Marker>
+        ))}
 
         <Polyline coordinates={track} strokeColor="blue" strokeWidth={2} />
       </MapView>
@@ -580,15 +339,7 @@ if (!isEqual) {
           {simMode ? '🛰️ Usar GPS real' : '🛠️ Usar modo simulación'}
         </Text>
       </TouchableOpacity>
-      {/* 
-      <View style={styles.legendBox}>
-        <Text style={styles.legendText}>🟡 TA: Tráfico cercano</Text>
-        <Text style={styles.legendText}>🟠 RA: Conflicto &lt; 3 min</Text>
-        <Text style={styles.legendText}>🔴 RA: Riesgo inminente &lt; 1 min</Text>
-      </View>
-*/}
     </View>
-    
   );
 };
 
@@ -635,22 +386,4 @@ const styles = StyleSheet.create({
     color: 'white',
     fontWeight: '600',
   },
-    legendBox: {
-    position: 'absolute',
-    bottom: 10,
-    left: 10,
-    backgroundColor: 'white',
-    borderRadius: 8,
-    padding: 8,
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-  },
-  legendText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#333',
-  },
-
 });

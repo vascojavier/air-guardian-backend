@@ -1,26 +1,9 @@
-import { Plane } from '../types/Plane';
+// utils/getRemotePlaneIcon.ts
 import { iconMap } from './iconMap';
 
-export const getRemotePlaneIcon = (
-  iconName: string = '2.png',
-  conflictLevel?: Plane['alertLevel']
-): any => {
-  const baseName = iconName
-    .replace('.png', '')
-    .replace('red', '')
-    .replace('orange', '')
-    .replace('yellow', '');
+export const getRemotePlaneIcon = (iconKey: string, isConflict: boolean): any => {
+  if (!iconKey) return iconMap['2'];
 
-  let suffix = '';
-  if (conflictLevel === 'RA_HIGH') {
-    suffix = 'red';
-  } else if (conflictLevel === 'RA_LOW') {
-    suffix = 'orange';
-  } else if (conflictLevel === 'TA') {
-    suffix = 'yellow';
-  }
-
-  const key = suffix ? `${baseName}${suffix}` : `${baseName}`;
-
-  return iconMap[key] || iconMap['2']; // fallback por si no existe
+  const key = isConflict ? `${iconKey}red` : iconKey;
+  return iconMap[key] || iconMap['2'];
 };

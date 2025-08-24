@@ -9,6 +9,4 @@ export interface Plane {
   type?: string;
   callsign?: string;
   aircraftIcon?: string;  // ✅ <--- AÑADÍ ESTA LÍNEA
-    alertLevel?: 'TA' | 'RA_LOW' | 'RA_HIGH' | 'none';
-  timeToImpact?: number; // ⏱️ nuevo
 }

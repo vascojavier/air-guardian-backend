@@ -17,7 +17,6 @@ const modelosDesdeLista = aircraftList.reduce((acc, modelo) => {
   return acc;
 }, { motor: [], glider: [] } as { motor: string[]; glider: string[] });
 
-
 export default function IndexScreen() {
   const { setUser, setAircraft } = useUser();
   const [name, setName] = useState('');
@@ -55,7 +54,7 @@ export default function IndexScreen() {
     cargarModelosGuardados();
   }, []);
 
-    useEffect(() => {
+  useEffect(() => {
     const cargarDatosPrevios = async () => {
       try {
         const datos = await AsyncStorage.getItem('datosUsuario');
@@ -85,7 +84,6 @@ export default function IndexScreen() {
     cargarDatosPrevios();
   }, []);
 
-
   useEffect(() => {
     const cargarIconosPersonalizados = async () => {
       try {
@@ -103,46 +101,42 @@ export default function IndexScreen() {
       setTimeout(() => otroModeloRef.current?.focus(), 100);
     }
   }, [aircraftModel]);
-  
-    useEffect(() => {
+
+  useEffect(() => {
     if (aircraftModel !== 'otro') {
       setCustomIcon('');
     }
-    }, [aircraftModel]);
+  }, [aircraftModel]);
 
+  useEffect(() => {
+    const modeloFinal = aircraftModel === 'otro' ? otroModelo.trim() : aircraftModel;
 
-    useEffect(() => {
-      const modeloFinal = aircraftModel === 'otro' ? otroModelo.trim() : aircraftModel;
-      const modeloLower = modeloFinal.toLowerCase();
+    let icono = aircraftType === 'glider' ? '1' : '2'; // default depende del tipo
 
-      let icono = aircraftType === 'glider' ? '1' : '2'; // default depende del tipo
+    // Buscar en aircraftList
+    const encontrado = aircraftList.find((a) => a.name === modeloFinal);
+    if (encontrado) {
+      icono = `${encontrado.category}`; // Ej: '3'
+    }
 
+    // Si tiene ícono personalizado guardado, lo prioriza
+    const iconoGuardado = iconosPersonalizados[modeloFinal];
+    if (iconoGuardado) {
+      icono = iconoGuardado;
+    }
 
-      // Buscar en aircraftList
-      const encontrado = aircraftList.find((a) => a.name === modeloFinal);
-      if (encontrado) {
-        icono = `${encontrado.category}`; // Ej: '3'
-      }
+    // Si el usuario eligió un customIcon (manual), se usa
+    if (customIcon.trim() && iconMap[customIcon.trim()]) {
+      icono = customIcon.trim();
+    }
 
-      // Si tiene ícono personalizado guardado, lo prioriza
-      const iconoGuardado = iconosPersonalizados[modeloFinal];
-      if (iconoGuardado) {
-        icono = iconoGuardado;
-      }
+    // Fallback final a categoría 2 si nada es válido
+    if (!iconMap[icono]) {
+      icono = '2';
+    }
 
-      // Si el usuario eligió un customIcon (manual), se usa
-      if (customIcon.trim() && iconMap[customIcon.trim()]) {
-        icono = customIcon.trim();
-      }
-
-      // Fallback final a categoría 2 si nada es válido
-      if (!iconMap[icono]) {
-        icono = '2';
-      }
-
-      setIconoPreview(icono);
-    }, [aircraftType, aircraftModel, otroModelo, customIcon, iconosPersonalizados]);
-
+    setIconoPreview(icono);
+  }, [aircraftType, aircraftModel, otroModelo, customIcon, iconosPersonalizados]);
 
   const eliminarModelo = async (modelo: string) => {
     try {
@@ -196,21 +190,39 @@ export default function IndexScreen() {
     setUser(name.trim(), role, callsign.trim());
     setAircraft(aircraftType, modeloFinal, finalIcon, callsign.trim());
 
+    await AsyncStorage.setItem('datosUsuario', JSON.stringify({
+      name: name.trim(),
+      callsign: callsign.trim(),
+      password,
+      aircraftType,
+      aircraftModel,
+      otroModelo,
+      customIcon
+    }));
 
+      // dentro de handleLogin, reemplaza SOLO la navegación final:
+        router.push('/Radar');
 
+  };
 
-await AsyncStorage.setItem('datosUsuario', JSON.stringify({
-  name: name.trim(),
-  callsign: callsign.trim(),
-  password,
-  aircraftType,
-  aircraftModel,
-  otroModelo,
-  customIcon
-}));
+  // 👉 Nuevo: botón directo a Pista con verificación de clave del campo
+  const goToPistaConClave = () => {
+    if (password !== 'aeroclub123') {
+      Alert.alert('Acceso restringido', 'Ingresá la contraseña de administrador para entrar a Pista.');
+      return;
+    }
+    // Si hay nombre/llamador cargados, setear rol admin para la sesión
+    const nombre = name.trim() || 'Admin';
+    const matricula = callsign.trim() || 'ADM';
+    setUser(nombre, 'aeroclub', matricula);
 
-router.push(isAdmin ? '/Pista' : '/Radar');
+    // Asegurar que tengamos algún avión seteado para no romper Radar luego
+    const modeloFinal = aircraftModel === 'otro' ? (otroModelo.trim() || 'Genérico') : (aircraftModel || 'Genérico');
+    const tipoFinal = aircraftType || 'motor';
+    const iconFinal = iconMap[iconoPreview] ? iconoPreview : '2';
+    setAircraft(tipoFinal, modeloFinal, iconFinal, matricula);
 
+    router.push('/Pista');
   };
 
   const handleCallsignChange = (text: string) => {
@@ -229,112 +241,116 @@ router.push(isAdmin ? '/Pista' : '/Radar');
   };
 
   return (
-<KeyboardAvoidingView
-  style={{ flex: 1 }}
-  behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-  keyboardVerticalOffset={Platform.OS === 'ios' ? 100 : 0}
->
-  <ScrollView
-    ref={scrollRef}
-    keyboardShouldPersistTaps="handled"
-    contentContainerStyle={{ flexGrow: 1, padding: 20, paddingBottom: 120 }}
-  >
-    <Text style={styles.label}>Tu nombre:</Text>
-    <TextInput style={styles.input} value={name} onChangeText={setName} placeholder="Tu nombre (piloto)" />
+    <KeyboardAvoidingView
+      style={{ flex: 1 }}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 100 : 0}
+    >
+      <ScrollView
+        ref={scrollRef}
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={{ flexGrow: 1, padding: 20, paddingBottom: 140 }}
+      >
+        <Text style={styles.label}>Tu nombre:</Text>
+        <TextInput style={styles.input} value={name} onChangeText={setName} placeholder="Tu nombre (piloto)" />
 
-    <Text style={styles.label}>Matrícula del avión:</Text>
-    <TextInput
-      style={styles.input}
-      value={callsign}
-      onChangeText={handleCallsignChange}
-      placeholder="Ej: LV-ABC123"
-      autoCapitalize="characters"
-    />
+        <Text style={styles.label}>Matrícula del avión:</Text>
+        <TextInput
+          style={styles.input}
+          value={callsign}
+          onChangeText={handleCallsignChange}
+          placeholder="Ej: LV-ABC123"
+          autoCapitalize="characters"
+        />
 
-    {country !== '' && <Text style={styles.label}>País detectado: {country}</Text>}
+        {country !== '' && <Text style={styles.label}>País detectado: {country}</Text>}
 
-    <Text style={styles.label}>Tipo de avión:</Text>
-    <Picker selectedValue={aircraftType} onValueChange={(value) => {
-      setAircraftType(value);
-      setAircraftModel('');
-      setOtroModelo('');
-      setCustomIcon('');
-    }} style={styles.picker}>
-      <Picker.Item label="Seleccionar..." value="" />
-      <Picker.Item label="A motor" value="motor" />
-      <Picker.Item label="Planeador" value="glider" />
-    </Picker>
-
-    {aircraftType !== '' && (
-      <>
-        <Text style={styles.label}>Modelo de avión:</Text>
-        <Picker selectedValue={aircraftModel} onValueChange={setAircraftModel} style={styles.picker}>
+        <Text style={styles.label}>Tipo de avión:</Text>
+        <Picker selectedValue={aircraftType} onValueChange={(value) => {
+          setAircraftType(value);
+          setAircraftModel('');
+          setOtroModelo('');
+          setCustomIcon('');
+        }} style={styles.picker}>
           <Picker.Item label="Seleccionar..." value="" />
-          {(aircraftType === 'motor' ? modelosMotor : modelosGlider).map((modelo) => (
-            <Picker.Item key={modelo} label={modelo} value={modelo} />
-          ))}
-          <Picker.Item label="Otro..." value="otro" />
+          <Picker.Item label="A motor" value="motor" />
+          <Picker.Item label="Planeador" value="glider" />
         </Picker>
 
-        {aircraftModel === 'otro' && (
+        {aircraftType !== '' && (
           <>
-            <TextInput
-              ref={otroModeloRef}
-              style={styles.input}
-              value={otroModelo}
-              onChangeText={setOtroModelo}
-              placeholder="Ingresá el modelo manualmente"
-              onFocus={() => scrollRef.current?.scrollToEnd({ animated: true })}
-            />
+            <Text style={styles.label}>Modelo de avión:</Text>
+            <Picker selectedValue={aircraftModel} onValueChange={setAircraftModel} style={styles.picker}>
+              <Picker.Item label="Seleccionar..." value="" />
+              {(aircraftType === 'motor' ? modelosMotor : modelosGlider).map((modelo) => (
+                <Picker.Item key={modelo} label={modelo} value={modelo} />
+              ))}
+              <Picker.Item label="Otro..." value="otro" />
+            </Picker>
 
-            <Text style={styles.label}>Elegí una categoría de avión:</Text>
-            <View style={styles.iconGallery}>
-              {[1, 2, 3, 4, 5, 6, 7].map((num) => {
-                const iconName = `${num}`;
-                return (
-                  <TouchableOpacity key={iconName} onPress={() => setCustomIcon(iconName)}>
-                    <Image
-                      source={iconMap[iconName]}
-                      style={[
-                        styles.iconOption,
-                        customIcon === iconName && styles.iconSelected,
-                      ]}
-                    />
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
+            {aircraftModel === 'otro' && (
+              <>
+                <TextInput
+                  ref={otroModeloRef}
+                  style={styles.input}
+                  value={otroModelo}
+                  onChangeText={setOtroModelo}
+                  placeholder="Ingresá el modelo manualmente"
+                  onFocus={() => scrollRef.current?.scrollToEnd({ animated: true })}
+                />
+
+                <Text style={styles.label}>Elegí una categoría de avión:</Text>
+                <View style={styles.iconGallery}>
+                  {[1, 2, 3, 4, 5, 6, 7].map((num) => {
+                    const iconName = `${num}`;
+                    return (
+                      <TouchableOpacity key={iconName} onPress={() => setCustomIcon(iconName)}>
+                        <Image
+                          source={iconMap[iconName]}
+                          style={[
+                            styles.iconOption,
+                            customIcon === iconName && styles.iconSelected,
+                          ]}
+                        />
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              </>
+            )}
+
+            {iconoPreview !== '' && (
+              <Image
+                source={iconMap[iconoPreview] || iconMap['default.png']}
+                style={{ width: 60, height: 60, alignSelf: 'center', marginVertical: 10 }}
+              />
+            )}
           </>
         )}
 
+        <Text style={styles.label}>Contraseña (si sos administrador):</Text>
+        <TextInput
+          style={styles.input}
+          value={password}
+          onChangeText={setPassword}
+          secureTextEntry
+          placeholder="opcional"
+          onFocus={() => scrollRef.current?.scrollToEnd({ animated: true })}
+        />
 
-        {iconoPreview !== '' && (
-          <Image
-            source={iconMap[iconoPreview] || iconMap['default.png']}
-            style={{ width: 60, height: 60, alignSelf: 'center', marginVertical: 10 }}
-          />
+        <View style={{ gap: 8, marginTop: 6 }}>
+          <Button title="Ingresar" onPress={handleLogin} />
+          {/* 👉 Botón nuevo para ir a Pista validando la contraseña del campo */}
+          <Button title="Ir a Pista (admin)" onPress={goToPistaConClave} color="#6C63FF" />
+        </View>
+
+        {aircraftModel && aircraftModel !== 'otro' && (
+          <View style={{ marginTop: 10 }}>
+            <Button title={`Eliminar modelo "${aircraftModel}"`} color="red" onPress={() => eliminarModelo(aircraftModel)} />
+          </View>
         )}
-      </>
-    )}
-
-    <Text style={styles.label}>Contraseña (si sos administrador):</Text>
-    <TextInput
-      style={styles.input}
-      value={password}
-      onChangeText={setPassword}
-      secureTextEntry
-      placeholder="opcional"
-      onFocus={() => scrollRef.current?.scrollToEnd({ animated: true })}
-    />
-
-    <Button title="Ingresar" onPress={handleLogin} />
-
-    {aircraftModel && aircraftModel !== 'otro' && (
-      <Button title={`Eliminar modelo "${aircraftModel}"`} color="red" onPress={() => eliminarModelo(aircraftModel)} />
-    )}
-  </ScrollView>
-</KeyboardAvoidingView>
-
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
