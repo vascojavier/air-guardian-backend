@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, StyleSheet, Dimensions, TouchableOpacity, Image, Alert, Platform, AppState } from 'react-native'; // === AG: import AppState ===
+import { View, Text, StyleSheet, Dimensions, TouchableOpacity, Image, Alert, Platform, AppState, ScrollView } from 'react-native';
 import MapView, { Marker, PROVIDER_GOOGLE, Polyline } from 'react-native-maps';
 import Slider from '@react-native-community/slider';
 import * as Location from 'expo-location';
@@ -17,6 +17,7 @@ import { Warning } from '../data/FunctionWarning';
 import { useFocusEffect } from "@react-navigation/native";
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Airfield } from '../types/airfield';
+
 
 
 
@@ -136,7 +137,7 @@ const Radar = () => {
       serverTime?: number;
     }
   }>(null);
-  const [runwayPanelOpen, setRunwayPanelOpen] = useState(false);
+  
 
 
   const [zoom, setZoom] = useState({ latitudeDelta: 0.1, longitudeDelta: 0.1 });
@@ -248,6 +249,125 @@ const priorizarWarningManual = (warning: Warning) => {
   setSelectedWarning(warning);
 };
 
+// === RUNWAY UI EFÍMERA (labels + banners 6s) ===
+const [runwayTapEnd, setRunwayTapEnd] = useState<'A'|'B'|null>(null);     // qué cabecera tocaste
+const [runwayLabelUntil, setRunwayLabelUntil] = useState<number>(0);      // expira a los 6s
+const [banner, setBanner] = useState<{ text: string; key?: string } | null>(null); // avisos 6s
+
+// flags de flujo
+const takeoffRequestedRef = useRef(false);
+const landingRequestedRef = useRef(false);
+const iAmOccupyingRef = useRef<null | 'landing' | 'takeoff'>(null); // sé si marqué occupy
+
+// cooldown anti-spam para banners
+const lastBannerAtRef = useRef<Record<string, number>>({});
+
+// estimar velocidad de pérdida (km/h) por tipo
+function estimateStallKmh(t: string|undefined) {
+  const up = (t||'').toUpperCase();
+  if (up.includes('GLIDER') || up.includes('PLANEADOR')) return 55;
+  if (up.includes('JET') || up.includes('LINEA')) return 180;
+  if (up.includes('TWIN') || up.includes('BIMOTOR')) return 110;
+  return 80; // monomotor liviano
+}
+
+// radio de medio giro (m) por tipo
+function halfTurnRadiusM(t: string|undefined) {
+  const up = (t||'').toUpperCase();
+  if (up.includes('GLIDER') || up.includes('PLANEADOR')) return 50;
+  if (up.includes('TWIN') || up.includes('BIMOTOR')) return 100;
+  if (up.includes('JET') || up.includes('LINEA')) return 500;
+  return 50; // monomotor liviano
+}
+
+// promedio entre velocidad actual y pérdida -> m/s
+function avgApproachSpeedMps(speedKmh: number, type?: string) {
+  const stall = estimateStallKmh(type);
+  const avgKmh = (Math.max(30, speedKmh) + stall) / 2;
+  return (avgKmh * 1000) / 3600;
+}
+
+// distancia punto–segmento (m) para saber si estás sobre la pista (eje)
+function distancePointToSegmentM(
+  p:{lat:number;lon:number},
+  a:{lat:number;lon:number},
+  b:{lat:number;lon:number}
+) {
+  const ax=a.lat, ay=a.lon, bx=b.lat, by=b.lon, px=p.lat, py=p.lon;
+  const abx=bx-ax, aby=by-ay;
+  const apx=px-ax, apy=py-ay;
+  const ab2 = abx*abx + aby*aby;
+  const u = Math.max(0, Math.min(1, ab2 ? ((apx*abx + apy*aby)/ab2) : 0));
+  const q = { lat: ax + u*abx, lon: ay + u*aby };
+  return getDistance(px, py, q.lat, q.lon);
+}
+
+function isOnRunwayStrip(): boolean {
+  if (!A_runway || !B_runway) return false;
+  const d = distancePointToSegmentM(
+    { lat: myPlane.lat, lon: myPlane.lon },
+    { lat: A_runway.latitude, lon: A_runway.longitude },
+    { lat: B_runway.latitude, lon: B_runway.longitude }
+  );
+  // ancho de pista + margen (aprox 40m)
+  return d <= 40;
+}
+
+function isNearThreshold(end:'A'|'B', radiusM=60): boolean {
+  const thr = end==='A' ? A_runway : B_runway;
+  if (!thr) return false;
+  return getDistance(myPlane.lat, myPlane.lon, thr.latitude, thr.longitude) <= radiusM;
+}
+
+// ETA a la cabecera activa (segundos), con penalidad por medio giro si venís por la opuesta
+function etaToActiveThresholdSec(): number | null {
+  if (!rw) return null;
+  const end = rw.active_end === 'B' ? 'B' : 'A';
+  const thr = end==='A' ? A_runway : B_runway;
+  if (!thr) return null;
+  const d = getDistance(myPlane.lat, myPlane.lon, thr.latitude, thr.longitude); // m
+  const v = avgApproachSpeedMps(myPlane.speed, myPlane.type);
+  if (!v) return null;
+
+  // penalidad si estás más cerca del umbral opuesto
+  const other = end==='A' ? B_runway : A_runway;
+  let extra = 0;
+  if (other) {
+    const dOther = getDistance(myPlane.lat, myPlane.lon, other.latitude, other.longitude);
+    if (dOther < d) {
+      extra = Math.PI * halfTurnRadiusM(myPlane.type);
+    }
+  }
+  return Math.round((d + extra) / v);
+}
+
+// banner 6s con anti-spam por key
+function flashBanner(text: string, key?: string) {
+  const now = Date.now();
+  if (key) {
+    const last = lastBannerAtRef.current[key] || 0;
+    if (now - last < 2500) return; // no repetir en <2.5s
+    lastBannerAtRef.current[key] = now;
+  }
+  setBanner({ text, key });
+  setTimeout(() => setBanner(null), 6000);
+}
+
+// al tocar la pista/cabecera -> abrir label 6s y sugerir alineamiento si vienes por contraria
+function showRunwayLabel(end:'A'|'B') {
+  setRunwayTapEnd(end);
+  setRunwayLabelUntil(Date.now() + 6000);
+  socketRef.current?.emit('runway-get'); // refresco al abrir
+
+  if (rw) {
+    const active = rw.active_end === 'B' ? 'B' : 'A';
+    const other = active==='A' ? 'B' : 'A';
+    const nearOther = isNearThreshold(other as 'A'|'B', 500); // del lado opuesto
+    if (nearOther) flashBanner('Por favor alinéese con la pista por la derecha', 'align-right');
+  }
+}
+
+
 // === RUNWAY: acción por defecto según altura relativa ===
 const defaultActionForMe = () => {
   const planeAlt = (myPlane?.alt ?? 0);
@@ -303,6 +423,23 @@ const markRunwayClear = () => {
   socketRef.current?.emit('runway-clear');
 };
 
+// === RUNWAY: wrappers para setear flags y banners ===
+const requestLandingLabel = () => {
+  requestLanding();
+  landingRequestedRef.current = true;
+};
+
+const requestTakeoffLabel = () => {
+  requestTakeoff(false);
+  takeoffRequestedRef.current = true;
+  flashBanner('Ir a cabecera de pista', 'go-threshold');
+};
+
+const cancelRunwayLabel = () => {
+  cancelMyRequest();
+  landingRequestedRef.current = false;
+  takeoffRequestedRef.current = false;
+};
 
 // ---- Focus hook #1: registro de socket / tráfico al enfocar Radar
 useFocusEffect(
@@ -794,6 +931,12 @@ useEffect(() => {
       setRunwayState(payload);
     });
 
+    // Banner de turno / mensajes desde el backend (mostrar 6s)
+    s.on('runway-msg', (m: any) => {
+      if (!m?.text) return;
+      // Mostrar banner efímero 6s usando tu propio sistema
+      flashBanner(m.text, m.key || 'runway-msg');
+    });
 
 
 
@@ -923,6 +1066,8 @@ useEffect(() => {
       s.off('disconnect');
       s.off('airfield-update');
       s.off('runway-state');
+      s.off('runway-msg');
+
 
       // si compartís un socket global, NO lo desconectes aquí
       // s.disconnect(); // <- dejalo comentado
@@ -1127,6 +1272,73 @@ if (
   // TA no setea hold (puede ser preempted por RA)
   }, [prioritizedWarning?.id, prioritizedWarning?.alertLevel]);
 
+
+  // === RUNWAY: Automatismos de avisos y ocupación/liberación ===
+useEffect(() => {
+  if (!rw) return;
+
+  // 1) "Liberar pista" si estoy sobre la pista (sin botón)
+  if (isOnRunwayStrip()) {
+    flashBanner('¡Liberar pista!', 'free-runway');
+    // si estoy aterrizando y aún no marqué occupy, marcar
+    if (landingRequestedRef.current && iAmOccupyingRef.current !== 'landing' && defaultActionForMe()==='land') {
+      markRunwayOccupy('landing');
+      iAmOccupyingRef.current = 'landing';
+    }
+  } else {
+    // si yo ocupaba, y ya salí de la pista -> clear
+    if (iAmOccupyingRef.current) {
+      markRunwayClear();
+      iAmOccupyingRef.current = null;
+    }
+  }
+
+  // 2) Permisos según turno y huecos
+  const me = myPlane?.id || username;
+  const st = runwayState?.state;
+  if (!st) return;
+
+  // permiso aterrizar cuando soy primero y pista libre
+  const firstLanding = (st.landings||[])[0];
+  if (firstLanding?.name === me && !st.inUse && defaultActionForMe()==='land') {
+    flashBanner('Tiene permiso para aterrizar', 'clr-land');
+  }
+
+  // solicitud despegue: guiar a cabecera, ocupar, y despegar
+  if (takeoffRequestedRef.current && defaultActionForMe()==='takeoff') {
+    const activeEnd = rw.active_end==='B'?'B':'A';
+    const nearThr = isNearThreshold(activeEnd, 80);
+    const nextLanding = (st.timeline||[]).find((x:any)=>x.action==='landing' && new Date(x.at).getTime() > Date.now());
+    const gapMin = nextLanding ? Math.round((new Date(nextLanding.at).getTime()-Date.now())/60000) : 999;
+
+    if (nearThr) {
+      const meTk = (st.takeoffs||[]).find((t:any)=>t.name===me);
+      const waited = meTk?.waitedMin ?? 0;
+      const can = (!st.inUse && (gapMin >= 5 || waited >= 15));
+      if (can && iAmOccupyingRef.current !== 'takeoff') {
+        flashBanner('Ocupe cabecera de pista', 'lineup');
+        // cuando te vemos entrar a pista cerca de cabecera -> occupy + "puede despegar"
+        if (isOnRunwayStrip()) {
+          markRunwayOccupy('takeoff');
+          iAmOccupyingRef.current = 'takeoff';
+          flashBanner('Puede despegar', 'cleared-tko');
+        }
+      }
+    }
+  }
+
+  // 3) Separación <5 min entre dos aterrizajes => al segundo: giro 360 por derecha
+  const myETA = etaToActiveThresholdSec();
+  if (landingRequestedRef.current && typeof myETA === 'number') {
+    const others = (st.landings||[]).filter((l:any)=>l.name!==me && typeof l.etaSec==='number');
+    const lead = others.sort((a:any,b:any)=>a.etaSec-b.etaSec)[0];
+    if (lead && (myETA - lead.etaSec) < 5*60) {
+      flashBanner('Haga un giro de 360° por derecha en espera', 'orbit-right');
+    }
+  }
+}, [myPlane.lat, myPlane.lon, myPlane.alt, myPlane.speed, runwayState, rw]);
+
+
   useEffect(() => {
     return () => {
       if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
@@ -1253,14 +1465,14 @@ if (
             <Polyline coordinates={[A_runway, B_runway]} strokeColor="black" strokeWidth={3} />
           )}
           {A_runway && (
-            <Marker coordinate={A_runway} title={`Cabecera A ${rw?.identA || ''}`}>
+            <Marker coordinate={A_runway} title={`Cabecera A ${rw?.identA || ''}`} onPress={() => showRunwayLabel('A')}>
               <View style={{ backgroundColor: '#2196F3', padding: 2, borderRadius: 10, minWidth: 20, alignItems: 'center' }}>
                 <Text style={{ color: 'white', fontWeight: 'bold', fontSize: 10 }}>A</Text>
               </View>
             </Marker>
           )}
           {B_runway && (
-            <Marker coordinate={B_runway} title={`Cabecera B ${rw?.identB || ''}`}>
+            <Marker coordinate={B_runway} title={`Cabecera B ${rw?.identB || ''}`} onPress={() => showRunwayLabel('B')}>
               <View style={{ backgroundColor: '#E53935', padding: 2, borderRadius: 10, minWidth: 20, alignItems: 'center' }}>
                 <Text style={{ color: 'white', fontWeight: 'bold', fontSize: 10 }}>B</Text>
               </View>
@@ -1270,6 +1482,7 @@ if (
             <Marker
               coordinate={runwayMid}
               title={`${rw?.identA ?? 'RWY'}`}
+              onPress={() => showRunwayLabel(rw?.active_end === 'B' ? 'B' : 'A')}
               anchor={{ x: 0.5, y: 0.5 }}
               flat
               rotation={runwayHeading}
@@ -1324,28 +1537,7 @@ if (
         />
       ) : null}
 
-        {/* === RUNWAY: botón para abrir el panel === */}
-        <TouchableOpacity
-          onPress={() => {
-            setRunwayPanelOpen(true);
-            // sincronizamos al abrir
-            socketRef.current?.emit('airfield-get');
-            socketRef.current?.emit('runway-get');
-          }}
-          style={{
-            position: 'absolute',
-            bottom: Platform.OS === 'android' ? 170 : 140, // por encima de tus botones
-            right: 18,
-            paddingHorizontal: 14,
-            paddingVertical: 10,
-            backgroundColor: 'white',
-            borderRadius: 12,
-            elevation: 3,
-            zIndex: 9999
-          }}
-        >
-          <Text style={{fontWeight:'600'}}>Pista</Text>
-        </TouchableOpacity>
+
 
 
       <TouchableOpacity onPress={toggleFollowMe} style={[
@@ -1373,120 +1565,146 @@ if (
         </Text>
       </TouchableOpacity>
 
+{/* === RUNWAY: Label efímero al tocar pista (6s) === */}
+{runwayTapEnd && Date.now() < runwayLabelUntil && (
+  <View style={{
+    position:'absolute', left:10, right:10, bottom: Platform.OS==='android'? 210 : 180,
+    backgroundColor:'#fff', borderRadius:14, padding:12, elevation:4
+  }}>
+    {/* Turno propio en rojo */}
+    <Text style={{color:'#C62828', fontWeight:'700', marginBottom:6}}>
+      {(() => {
+        const me = myPlane?.id || username;
+        const ls = runwayState?.state?.landings || [];
+        const ts = runwayState?.state?.takeoffs || [];
+        const action = defaultActionForMe();
+        const list = action==='land' ? ls : ts;
+        const idx = list.findIndex((x:any)=>x?.name===me);
+        return idx >= 0 ? `Turno #${idx+1}` : 'Sin turno asignado';
+      })()}
+    </Text>
 
+    {/* Quién está en uso */}
+    <Text style={{fontWeight:'700', marginBottom:4}}>
+      {runwayState?.state?.inUse
+        ? `${runwayState.state.inUse.action==='landing'?'Aterrizando':'Despegando'} — `
+          + `${runwayState.state.inUse.name} (${runwayState.state.inUse.callsign||'—'})`
+        : 'Pista libre'}
+    </Text>
 
-{/* === RUNWAY: Cartel de Pista (sheet) === */}
-{runwayPanelOpen && (
-  <View
-    pointerEvents="box-none"
-    style={{
-      position:'absolute', left:0, right:0, bottom:0,
-      backgroundColor:'#fff',
-      borderTopLeftRadius:16, borderTopRightRadius:16,
-      padding:14, elevation:8, zIndex:9999
-    }}
-  >
-    <View style={{flexDirection:'row', justifyContent:'space-between', alignItems:'center', marginBottom:8}}>
-      <Text style={{fontSize:16, fontWeight:'700'}}>
-        {(runwayState?.airfield?.ident ?? rw?.identA ?? 'Pista')}
-        {` — ${runwayState?.airfield?.runwayIdent ?? airfield?.runways?.[0]?.identA ?? ''}`}
-      </Text>
-      <TouchableOpacity onPress={() => setRunwayPanelOpen(false)}>
-        <Text style={{fontSize:18}}>✕</Text>
-      </TouchableOpacity>
+    {/* Acciones según estado (volando/tierra) */}
+    <View style={{flexDirection:'row', gap:10, flexWrap:'wrap', marginBottom:6}}>
+      {(() => {
+        const action = defaultActionForMe();
+        const already =
+          (action==='land' && landingRequestedRef.current) ||
+          (action==='takeoff' && takeoffRequestedRef.current);
+
+        if (already) {
+          return (
+            <TouchableOpacity onPress={cancelRunwayLabel}
+              style={{backgroundColor:'#eee', paddingHorizontal:12, paddingVertical:8, borderRadius:10}}>
+              <Text>Cancelar {action==='land'?'aterrizaje':'despegue'}</Text>
+            </TouchableOpacity>
+          );
+        }
+
+        if (action==='land') {
+          return (
+            <>
+              <TouchableOpacity onPress={requestLandingLabel}
+                style={{backgroundColor:'#111', paddingHorizontal:12, paddingVertical:8, borderRadius:10}}>
+                <Text style={{color:'#fff', fontWeight:'600'}}>Solicitar Aterrizaje</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={()=>{
+                  socketRef.current?.emit('runway-request',{
+                    action:'land', name: myPlane?.id||username,
+                    callsign: callsign||'', aircraft: aircraftModel||'',
+                    type: aircraftModel||'', emergency:true, altitude: myPlane?.alt??0
+                  });
+                  landingRequestedRef.current = true;
+                  flashBanner('EMERGENCIA declarada', 'emg');
+                }}
+                style={{backgroundColor:'#b71c1c', paddingHorizontal:12, paddingVertical:8, borderRadius:10}}
+              >
+                <Text style={{color:'#fff', fontWeight:'700'}}>EMERGENCIA</Text>
+              </TouchableOpacity>
+            </>
+          );
+        }
+
+        // en tierra: solo despegue
+        return (
+          <TouchableOpacity onPress={requestTakeoffLabel}
+            style={{backgroundColor:'#111', paddingHorizontal:12, paddingVertical:8, borderRadius:10}}>
+            <Text style={{color:'#fff', fontWeight:'600'}}>Solicitar Despegue</Text>
+          </TouchableOpacity>
+        );
+      })()}
     </View>
 
-    {/* Estado actual */}
-    {runwayState?.state?.inUse ? (
-      <Text style={{marginBottom:6}}>
-        En uso: {runwayState.state.inUse.action === 'landing' ? 'Aterrizando' : 'Despegando'} — {runwayState.state.inUse.name} ({runwayState.state.inUse.callsign || '—'})
-      </Text>
-    ) : (
-      <Text style={{marginBottom:6}}>Pista libre</Text>
-    )}
+{/* Cola completa (scrolleable si es larga) */}
+<Text style={{fontWeight:'600', marginTop:4, marginBottom:4}}>
+  {defaultActionForMe()==='land' ? 'Cola de aterrizajes' : 'Cola de despegues'}
+</Text>
 
-    {/* Acciones */}
-    <View style={{flexDirection:'row', gap:10, marginBottom:8, flexWrap:'wrap'}}>
-      <TouchableOpacity
-        onPress={defaultActionForMe() === 'land' ? requestLanding : () => requestTakeoff(false)}
-        style={{backgroundColor:'#111', paddingHorizontal:12, paddingVertical:10, borderRadius:10}}
-      >
-        <Text style={{color:'#fff', fontWeight:'600'}}>
-          Solicitar {defaultActionForMe() === 'land' ? 'Aterrizaje' : 'Despegue'}
-        </Text>
-      </TouchableOpacity>
+<View style={{maxHeight: 180}}>
+  <ScrollView>
+    {(() => {
+      const me = myPlane?.id||username;
+      const action = defaultActionForMe();
+      const list = action==='land'
+        ? (runwayState?.state?.landings||[])
+        : (runwayState?.state?.takeoffs||[]);
 
-      <TouchableOpacity
-        onPress={cancelMyRequest}
-        style={{backgroundColor:'#eee', paddingHorizontal:12, paddingVertical:10, borderRadius:10}}
-      >
-        <Text>Cancelar</Text>
-      </TouchableOpacity>
-    </View>
+      if (!list.length) return <Text style={{fontSize:12}}>(vacío)</Text>;
 
-    {/* Despegue: listo en cabecera + ocupar/liberar */}
-    <View style={{flexDirection:'row', gap:10, marginBottom:10, flexWrap:'wrap'}}>
-      <TouchableOpacity
-        onPress={() => requestTakeoff(true)}
-        style={{borderWidth:1, borderColor:'#ccc', paddingHorizontal:12, paddingVertical:10, borderRadius:10}}
-      >
-        <Text>Estoy en cabecera (listo)</Text>
-      </TouchableOpacity>
+      return list.map((x:any, i:number) => {
+        const mine = x?.name === me;
+        const etaMin   = typeof x?.etaSec === 'number' ? Math.round(x.etaSec/60) : null;
+        const waited   = typeof x?.waitedMin === 'number' ? x.waitedMin : null;
+        const tags = [
+          x?.emergency ? 'EMERGENCIA' : null,
+          (action==='land' && x?.holding) ? 'HOLD' : null,
+          (action==='takeoff' && x?.ready) ? 'LISTO' : null,
+          (action==='takeoff' && waited!=null) ? `+${waited}m` : null,
+        ].filter(Boolean).join(' · ');
 
-      <TouchableOpacity
-        onPress={() => markRunwayOccupy('takeoff')}
-        style={{borderWidth:1, borderColor:'#ccc', paddingHorizontal:12, paddingVertical:10, borderRadius:10}}
-      >
-        <Text>Ocupar pista (despegue)</Text>
-      </TouchableOpacity>
+        return (
+          <Text
+            key={x?.name || i}
+            style={{
+              fontSize:12,
+              marginBottom:2,
+              ...(mine ? { fontWeight:'700', color:'#C62828' } : {})
+            }}
+          >
+            #{i+1} {x?.name}{x?.callsign ? ` (${x.callsign})` : ''}
+            {etaMin!=null ? ` — ETA ${etaMin} min` : ''}
+            {tags ? ` — [${tags}]` : ''}
+          </Text>
+        );
+      });
+    })()}
+  </ScrollView>
+</View>
 
-      <TouchableOpacity
-        onPress={() => markRunwayOccupy('landing')}
-        style={{borderWidth:1, borderColor:'#ccc', paddingHorizontal:12, paddingVertical:10, borderRadius:10}}
-      >
-        <Text>Ocupar pista (aterrizaje)</Text>
-      </TouchableOpacity>
-
-      <TouchableOpacity
-        onPress={markRunwayClear}
-        style={{borderWidth:1, borderColor:'#ccc', paddingHorizontal:12, paddingVertical:10, borderRadius:10}}
-      >
-        <Text>Liberar pista</Text>
-      </TouchableOpacity>
-    </View>
-
-    {/* Turnos de aterrizaje */}
-    <Text style={{fontWeight:'600', marginBottom:4}}>Turnos de aterrizaje (ETA / holding):</Text>
-    {(runwayState?.state?.landings ?? []).map((l:any, i:number) => (
-      <Text key={l.name ?? i}>
-        {i+1}. {l.name} {l.emergency ? '[EMERGENCIA] ' : ''}{(l.type||'').toUpperCase().includes('GLIDER') && (l.altitude<300 ? '[GLIDER<300m] ' : '[GLIDER] ')}
-        — ETA {l.etaSec ? Math.round(l.etaSec/60)+' min' : '—'} {l.holding ? '(HOLD)' : ''}
-      </Text>
-    ))}
-
-    {/* Despegues */}
-    <Text style={{fontWeight:'600', marginTop:10, marginBottom:4}}>Despegues:</Text>
-    {(runwayState?.state?.takeoffs ?? []).map((t:any, i:number) => (
-      <Text key={t.name ?? i}>
-        {i+1}. {t.name} — {t.ready ? 'Listo en cabecera' : 'En rodaje'} — espera {t.waitedMin ?? 0} min
-      </Text>
-    ))}
-
-    {/* Próximos slots */}
-    <Text style={{fontWeight:'600', marginTop:10, marginBottom:4}}>Próximos slots:</Text>
-    {(runwayState?.state?.timeline ?? []).slice(0,5).map((s:any, i:number) => (
-      <Text key={i}>
-        {s.action === 'landing' ? 'Aterrizaje' : 'Despegue'} — {s.name} a las {new Date(s.at).toLocaleTimeString()}
-      </Text>
-    ))}
-
-    {/* Instrucción estándar */}
-    <View style={{marginTop:12, padding:10, backgroundColor:'#f3f3f3', borderRadius:12}}>
-      <Text style={{fontWeight:'600', marginBottom:4}}>Instrucciones de espera</Text>
-      <Text>Si su aterrizaje no es el primero y su ETA cae dentro de 5 min del anterior, haga un círculo a la derecha y alinéese con el lado derecho de la pista antes del giro final.</Text>
-    </View>
   </View>
 )}
+
+{/* === RUNWAY: Banner efímero 6s === */}
+{banner && (
+  <View style={{
+    position:'absolute', left:10, right:10, bottom: Platform.OS==='android'? 270 : 240,
+    backgroundColor:'#263238', borderRadius:12, padding:10, elevation:4
+  }}>
+    <Text style={{color:'#fff', textAlign:'center', fontWeight:'700'}}>{banner.text}</Text>
+  </View>
+)}
+
+
+
 
 
 
