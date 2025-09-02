@@ -20,10 +20,6 @@ import { Airfield } from '../types/airfield';
 
 
 
-
-
-
-
 interface LatLon {
   latitude: number;
   longitude: number;
@@ -261,6 +257,8 @@ const iAmOccupyingRef = useRef<null | 'landing' | 'takeoff'>(null); // sé si ma
 
 // cooldown anti-spam para banners
 const lastBannerAtRef = useRef<Record<string, number>>({});
+const landClearShownRef = useRef(false);
+
 
 // estimar velocidad de pérdida (km/h) por tipo
 function estimateStallKmh(t: string|undefined) {
@@ -365,6 +363,41 @@ function showRunwayLabel(end:'A'|'B') {
     const nearOther = isNearThreshold(other as 'A'|'B', 500); // del lado opuesto
     if (nearOther) flashBanner('Por favor alinéese con la pista por la derecha', 'align-right');
   }
+}
+
+// --- PERMISO DE ATERRIZAJE SEGÚN DISTANCIA ---
+type Cat = 'GLIDER_HELI' | 'PROP' | 'BIZJET' | 'AIRLINER';
+
+function aircraftCategory(t?: string): Cat {
+  const up = (t || '').toUpperCase();
+  if (up.includes('GLIDER') || up.includes('PLANEADOR') || up.includes('HELI')) return 'GLIDER_HELI';
+  // Airliners (heurística)
+  if (
+    up.includes('AIRBUS') || up.includes('BOEING') || up.includes('A3') || up.includes('B7') ||
+    up.includes('E19') || up.includes('E17') || up.includes('E-JET') || up.includes('A32') || up.includes('A33')
+  ) return 'AIRLINER';
+  // Jets no comerciales (bizjets)
+  if (up.includes('JET')) return 'BIZJET';
+  // Turboprop y hélice
+  if (up.includes('TURBOPROP') || up.includes('HELICES') || up.includes('HÉLICE') || up.includes('HÉLICE') || up.includes('PROP')) return 'PROP';
+  return 'PROP';
+}
+
+// Distancias de permiso (en metros)
+// (Si querés ajustar airliners, cambiá 8000 por el valor que prefieras)
+const PERMIT_RADIUS_M: Record<Cat, number> = {
+  GLIDER_HELI: 500,    // planeadores y helicópteros
+  PROP:        2000,   // aviones a hélice
+  BIZJET:      5000,   // jets no comerciales
+  AIRLINER:    8000,   // línea (sugerencia)
+};
+
+function distToActiveThresholdM(): number | null {
+  if (!rw) return null;
+  const end = rw.active_end === 'B' ? 'B' : 'A';
+  const thr = end === 'A' ? A_runway : B_runway;
+  if (!thr) return null;
+  return getDistance(myPlane.lat, myPlane.lon, thr.latitude, thr.longitude); // metros
 }
 
 
@@ -931,12 +964,13 @@ useEffect(() => {
       setRunwayState(payload);
     });
 
-    // Banner de turno / mensajes desde el backend (mostrar 6s)
+    // Banner de turno / mensajes desde el backend (6 s con anti-spam)
     s.on('runway-msg', (m: any) => {
       if (!m?.text) return;
-      // Mostrar banner efímero 6s usando tu propio sistema
-      flashBanner(m.text, m.key || 'runway-msg');
+      // usá flashBanner para integrarlo con tu UI efímera
+      flashBanner(m.text, `srv:${m.key || m.text}`);
     });
+
 
 
 
@@ -1298,11 +1332,29 @@ useEffect(() => {
   const st = runwayState?.state;
   if (!st) return;
 
-  // permiso aterrizar cuando soy primero y pista libre
-  const firstLanding = (st.landings||[])[0];
-  if (firstLanding?.name === me && !st.inUse && defaultActionForMe()==='land') {
-    flashBanner('Tiene permiso para aterrizar', 'clr-land');
+// permiso de aterrizar: sólo si soy #1, pista libre y estoy dentro del radio según tipo
+const firstLanding = (st.landings || [])[0];
+if (firstLanding?.name === me && !st.inUse && defaultActionForMe() === 'land') {
+  const distM = distToActiveThresholdM();
+  const cat = aircraftCategory(aircraftModel || (myPlane as any)?.type);
+  const radius = PERMIT_RADIUS_M[cat];
+
+  if (typeof distM === 'number') {
+    if (distM <= radius) {
+      if (!landClearShownRef.current) {
+        flashBanner('Tiene permiso para aterrizar', 'clr-land');
+        landClearShownRef.current = true; // mostrar una vez por “aproximación”
+      }
+    } else {
+      // si te volviste a alejar, reseteamos para poder volver a mostrar al reingresar
+      landClearShownRef.current = false;
+    }
   }
+} else {
+  // si dejaste de ser #1 o la pista se ocupó, resetea
+  landClearShownRef.current = false;
+}
+
 
   // solicitud despegue: guiar a cabecera, ocupar, y despegar
   if (takeoffRequestedRef.current && defaultActionForMe()==='takeoff') {
@@ -1567,22 +1619,32 @@ useEffect(() => {
 
 {/* === RUNWAY: Label efímero al tocar pista (6s) === */}
 {runwayTapEnd && Date.now() < runwayLabelUntil && (
-  <View style={{
-    position:'absolute', left:10, right:10, bottom: Platform.OS==='android'? 210 : 180,
-    backgroundColor:'#fff', borderRadius:14, padding:12, elevation:4
-  }}>
-    {/* Turno propio en rojo */}
+    <View style={{
+      position:'absolute', left:10, right:10, bottom: Platform.OS==='android'? 210 : 180,
+      backgroundColor:'#fff', borderRadius:14, padding:12, elevation:4
+    }}>
+
+    {/* Turno propio en rojo (usa la cola donde REALMENTE estoy) */}
     <Text style={{color:'#C62828', fontWeight:'700', marginBottom:6}}>
       {(() => {
         const me = myPlane?.id || username;
         const ls = runwayState?.state?.landings || [];
         const ts = runwayState?.state?.takeoffs || [];
-        const action = defaultActionForMe();
-        const list = action==='land' ? ls : ts;
-        const idx = list.findIndex((x:any)=>x?.name===me);
+
+        const iL = ls.findIndex((x:any)=>x?.name===me);
+        const iT = ts.findIndex((x:any)=>x?.name===me);
+
+        // si estoy en alguna cola, usar esa; si no, caer a defaultActionForMe()
+        const activeList =
+          iL >= 0 ? ls :
+          iT >= 0 ? ts :
+          (defaultActionForMe()==='land' ? ls : ts);
+
+        const idx = activeList.findIndex((x:any)=>x?.name===me);
         return idx >= 0 ? `Turno #${idx+1}` : 'Sin turno asignado';
       })()}
     </Text>
+
 
     {/* Quién está en uso */}
     <Text style={{fontWeight:'700', marginBottom:4}}>
@@ -1661,13 +1723,13 @@ useEffect(() => {
       if (!list.length) return <Text style={{fontSize:12}}>(vacío)</Text>;
 
       return list.map((x:any, i:number) => {
-        const mine = x?.name === me;
-        const etaMin   = typeof x?.etaSec === 'number' ? Math.round(x.etaSec/60) : null;
-        const waited   = typeof x?.waitedMin === 'number' ? x.waitedMin : null;
+        const mine   = x?.name === me;
+        const etaMin = typeof x?.etaSec === 'number' ? Math.round(x.etaSec/60) : null;
+        const waited = typeof x?.waitedMin === 'number' ? x.waitedMin : null;
         const tags = [
           x?.emergency ? 'EMERGENCIA' : null,
-          (action==='land' && x?.holding) ? 'HOLD' : null,
-          (action==='takeoff' && x?.ready) ? 'LISTO' : null,
+          (action==='land'    && x?.holding) ? 'HOLD'  : null,
+          (action==='takeoff' && x?.ready)   ? 'LISTO' : null,
           (action==='takeoff' && waited!=null) ? `+${waited}m` : null,
         ].filter(Boolean).join(' · ');
 
@@ -1689,6 +1751,7 @@ useEffect(() => {
     })()}
   </ScrollView>
 </View>
+
 
   </View>
 )}
