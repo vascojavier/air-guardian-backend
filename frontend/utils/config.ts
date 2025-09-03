@@ -1,1 +1,1 @@
-export const SERVER_URL = 'https://air-guardian-backend.onrender.com';
+export const BACKEND_URL = 'https://air-guardian-backend.onrender.com';
