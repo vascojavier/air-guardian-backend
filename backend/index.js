@@ -127,42 +127,6 @@ function estimateGSms(name) {
 
 
 
-// helper: cabecera activa (A o B) soportando formato con runways[0] y 'lng'
-function getActiveThresholdLatLon() {
-  if (!lastAirfield) return null;
-
-  // Formato nuevo: airfield.runways[0].active_end + thresholdA/B { lat, lng }
-  if (Array.isArray(lastAirfield.runways) && lastAirfield.runways.length > 0) {
-    const rw = lastAirfield.runways[0];
-    const end = rw.active_end === 'B' ? 'thresholdB' : 'thresholdA';
-    const thr = rw[end];
-    if (thr && typeof thr.lat === 'number' && (typeof thr.lon === 'number' || typeof thr.lng === 'number')) {
-      return { lat: thr.lat, lon: (typeof thr.lon === 'number' ? thr.lon : thr.lng) };
-    }
-  }
-
-  // Fallback legado: lastAirfield.thresholdA/B {lat, lon|lng} + activeThreshold
-  const thrKey = lastAirfield.activeThreshold === 'B' ? 'thresholdB' : 'thresholdA';
-  const thr = lastAirfield[thrKey];
-  if (thr && typeof thr.lat === 'number' && (typeof thr.lon === 'number' || typeof thr.lng === 'number')) {
-    return { lat: thr.lat, lon: (typeof thr.lon === 'number' ? thr.lon : thr.lng) };
-  }
-
-  return null;
-}
-
-// ETA a cabecera activa (segundos)
-function computeETASeconds(name) {
-  const thr = getActiveThresholdLatLon();
-  const u = userLocations[name];
-  if (!thr || !u) return null;
-  const d = getDistance(u.latitude, u.longitude, thr.lat, thr.lon); // metros
-  const gs = estimateGSms(name); // m/s
-  if (!gs || !isFinite(gs) || gs <= 0) return null;
-  return Math.max(1, Math.round(d / gs));
-}
-
-
 
 // prioridad: menor es mejor
 function landingPriorityScore(item) {
@@ -180,28 +144,7 @@ function cleanupInUseIfDone() {
   if (Date.now() > end) runwayState.inUse = null;
 }
 
-// snapshot para avisar cambios de turno
-let lastTurnSnapshot = new Map(); // name -> turnIndex
-  // avisar si cambió el turno de alguien
-  const curr = new Map();
-  runwayState.landings.forEach(l => curr.set(l.name, l.turnIndex));
 
-  for (const [name, turn] of curr.entries()) {
-    const prev = lastTurnSnapshot.get(name);
-    if (prev == null || prev !== turn) {
-      // enviar banner sólo a ese usuario
-      const info = userLocations[name];
-      if (info && info.socketId) {
-        io.to(info.socketId).emit('runway-banners', [{
-          id: `turn-${Date.now()}`,
-          kind: 'turn',
-          text: `Tu turno ahora es ${turn}`,
-          ttlMs: 6000
-        }]);
-      }
-    }
-  }
-  lastTurnSnapshot = curr;
 
   
 // (re)planificar secuencia usando lastAirfield
@@ -727,13 +670,6 @@ setInterval(() => {
   }
 }, 30000);
 
-// Recompute de ETAs y orden cada 2s (por si cambian sin eventos)
-setInterval(() => {
-  if (runwayState.landings.length || runwayState.takeoffs.length) {
-    planRunwaySequence();
-    publishRunwayState();
-  }
-}, 2000);
 
 
 // --- Ruta para obtener tráfico aéreo cercano ---
