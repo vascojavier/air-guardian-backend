@@ -51,6 +51,47 @@ const midpointToLoc = (A: LatLng, B: LatLng) => ({
   lng: (A.longitude + B.longitude) / 2,
 });
 
+
+// --- Beacons / Geodesia ---
+const NM_TO_M = 1852;
+const B1_DIST_NM = 3.5;    // ~3–4 NM
+const B2_DIST_NM = 7.0;    // ~6–8 NM
+
+const toRad = (deg: number) => (deg * Math.PI) / 180;
+const toDeg = (rad: number) => (rad * 180) / Math.PI;
+
+function destinationPoint(start: LatLng, bearingDeg: number, distM: number): LatLng {
+  const δ = distM / 6371008.8; // IUGG radius
+  const θ = toRad(bearingDeg);
+  const φ1 = toRad(start.latitude);
+  const λ1 = toRad(start.longitude);
+  const sinφ1 = Math.sin(φ1), cosφ1 = Math.cos(φ1);
+  const sinδ = Math.sin(δ), cosδ = Math.cos(δ);
+  const sinφ2 = sinφ1 * cosδ + cosφ1 * sinδ * Math.cos(θ);
+  const φ2 = Math.asin(sinφ2);
+  const y = Math.sin(θ) * sinδ * cosφ1;
+  const x = cosδ - sinφ1 * sinφ2;
+  const λ2 = λ1 + Math.atan2(y, x);
+  return { latitude: toDeg(φ2), longitude: ((toDeg(λ2) + 540) % 360) - 180 };
+}
+
+function computeApproachBearing(A: LatLng, B: LatLng, active: 'A' | 'B'): number {
+  const thr = active === 'A' ? A : B;
+  const opp = active === 'A' ? B : A;
+  const hdg_thr_to_opp = calcularRumbo(thr, opp);   // rumbo umbral -> opuesta
+  return (hdg_thr_to_opp + 180) % 360;              // aproximación viene desde afuera
+}
+
+function makeDefaultBeacons(A: LatLng, B: LatLng, active: 'A'|'B') {
+  const thr = active === 'A' ? A : B;
+  const app = computeApproachBearing(A, B, active);
+  const B1 = destinationPoint(thr, app, B1_DIST_NM * NM_TO_M);
+  const B2 = destinationPoint(thr, app, B2_DIST_NM * NM_TO_M);
+  return { B1, B2 };
+}
+
+
+
 // ---------------------- Socket ----------------------
 // ⛔️ ELIMINÁ estas líneas (y su import):
 // import ioDefault from 'socket.io-client';
@@ -73,6 +114,9 @@ export default function PistaScreen() {
   const [numeroPista, setNumeroPista] = useState<string>('');
   const [showModal, setShowModal] = useState<boolean>(false);
   const [showDetails, setShowDetails] = useState(true);
+  const [beaconB1, setBeaconB1] = useState<LatLng | null>(null);
+  const [beaconB2, setBeaconB2] = useState<LatLng | null>(null);
+
 
   // Asegurar conexión cuando entra a Pista
   useEffect(() => {
@@ -93,13 +137,32 @@ export default function PistaScreen() {
             const B: LatLng = { latitude: rw.thresholdB.lat, longitude: rw.thresholdB.lng };
             setCabeceraA(A);
             setCabeceraB(B);
-            const active = rw.active_end ?? 'A';
+            const active = (rw.active_end ?? 'A') as 'A' | 'B';
             setCabeceraActiva(active);
             const baseHeading = rw.heading_true_ab;
             setRumbo(active === 'A' ? baseHeading : (baseHeading + 180) % 360);
             setNumeroPista(rw.identA ?? '');
+
+            // ==== Beacons: usar los guardados si existen, si no autogenerar ====
+            const beaconsAny = (rw as any).beacons;
+            if (Array.isArray(beaconsAny) && beaconsAny.length >= 2) {
+              const b1 = beaconsAny.find((b: any) => (b.name || '').toUpperCase() === 'B1');
+              const b2 = beaconsAny.find((b: any) => (b.name || '').toUpperCase() === 'B2');
+              if (b1 && b2) {
+                setBeaconB1({ latitude: b1.lat, longitude: b1.lon });
+                setBeaconB2({ latitude: b2.lat, longitude: b2.lon });
+              } else {
+                const { B1, B2 } = makeDefaultBeacons(A, B, active);
+                setBeaconB1(B1); setBeaconB2(B2);
+              }
+            } else {
+              const { B1, B2 } = makeDefaultBeacons(A, B, active);
+              setBeaconB1(B1); setBeaconB2(B2);
+            }
+
             return;
           }
+
         }
         // Fallback legacy
         const datos = await AsyncStorage.getItem('pistaActiva');
@@ -181,6 +244,21 @@ async function emitAirfieldUpsertReliable(af: Airfield, reuse?: ReturnType<typeo
   });
 }
 
+async function persistBeaconsAndEmit(b1: LatLng, b2: LatLng) {
+  const raw = await AsyncStorage.getItem('airfieldActive');
+  if (!raw) return;
+  const af: Airfield = JSON.parse(raw);
+  if (!af?.runways?.[0]) return;
+
+  (af.runways[0] as any).beacons = [
+    { name: 'B1', lat: b1.latitude, lon: b1.longitude },
+    { name: 'B2', lat: b2.latitude, lon: b2.longitude },
+  ];
+  af.lastUpdated = Date.now();
+  await AsyncStorage.setItem('airfieldActive', JSON.stringify(af));
+
+  try { socket?.emit?.('airfield-upsert', { airfield: af }); } catch {}
+}
 
 
 const cambiarCabecera = async () => {
@@ -207,6 +285,18 @@ const cambiarCabecera = async () => {
     if (!af?.runways?.[0]) return;
 
     af.runways[0].active_end = nueva;
+          // Regenerar beacons según cabecera nueva (si no fueron custom movidos)
+      try {
+        if (cabeceraA && cabeceraB) {
+          const { B1, B2 } = makeDefaultBeacons(cabeceraA, cabeceraB, nueva);
+          setBeaconB1(B1); setBeaconB2(B2);
+          (af.runways[0] as any).beacons = [
+            { name: 'B1', lat: B1.latitude, lon: B1.longitude },
+            { name: 'B2', lat: B2.latitude, lon: B2.longitude },
+          ];
+        }
+      } catch {}
+
     af.lastUpdated = Date.now();
     await AsyncStorage.setItem('airfieldActive', JSON.stringify(af));
 
@@ -247,6 +337,15 @@ const cambiarCabecera = async () => {
       heading_true_ab: rumboAB,
       active_end: activa,
     };
+
+        // Agregar beacons al runway
+    const { B1, B2 } = makeDefaultBeacons(cabeceraA, cabeceraB, activa);
+    (runway as any).beacons = [
+      { name: 'B1', lat: B1.latitude, lon: B1.longitude },
+      { name: 'B2', lat: B2.latitude, lon: B2.longitude },
+    ];
+    setBeaconB1(B1); setBeaconB2(B2);
+
 
     const airfield: Airfield = {
       id: uuid(),
@@ -315,6 +414,63 @@ const cambiarCabecera = async () => {
         {cabeceraA && cabeceraB && (
           <Polyline coordinates={[cabeceraA, cabeceraB]} strokeColor="black" strokeWidth={2} />
         )}
+        {/* Línea guía B2 -> B1 -> Umbral activo */}
+
+
+        {beaconB1 && beaconB2 && cabeceraA && cabeceraB && cabeceraActiva && (
+          <Polyline
+            coordinates={[
+              beaconB2,
+              beaconB1,
+              cabeceraActiva === 'A' ? cabeceraA : cabeceraB
+            ]}
+            strokeColor="green"
+            strokeWidth={2}
+          />
+        )}
+        {/* B2 (draggable) */}
+
+
+        {beaconB2 && (
+          <Marker
+            coordinate={beaconB2}
+            draggable
+            onDragEnd={async (e) => {
+              const c = e.nativeEvent.coordinate;
+              setBeaconB2(c);
+              if (beaconB1) await persistBeaconsAndEmit(beaconB1, c);
+            }}
+            title="B2"
+            description="Punto de pre-secuencia"
+          >
+            <View style={[styles.marker, { backgroundColor: '#673AB7' }]}>
+              <Text style={styles.markerText}>B2</Text>
+            </View>
+          </Marker>
+        )}
+        {/* B1 (draggable) */}
+
+
+        {beaconB1 && (
+          <Marker
+            coordinate={beaconB1}
+            draggable
+            onDragEnd={async (e) => {
+              const c = e.nativeEvent.coordinate;
+              setBeaconB1(c);
+              if (beaconB2) await persistBeaconsAndEmit(c, beaconB2);
+            }}
+            title="B1"
+            description="Freeze point (final)"
+          >
+            <View style={[styles.marker, { backgroundColor: '#4CAF50' }]}>
+              <Text style={styles.markerText}>B1</Text>
+            </View>
+          </Marker>
+        )}
+
+
+
         {cabeceraA && cabeceraB && cabeceraActiva && (
           <Marker
             coordinate={calcularPuntoIntermedio(cabeceraA, cabeceraB)}
@@ -349,16 +505,34 @@ const cambiarCabecera = async () => {
       </Modal>
 
       <View style={styles.panel}>
-        {cabeceraActiva && <Text style={styles.text}>Cabecera activa: {cabeceraActiva}</Text>}
+        {cabeceraActiva && (
+          <Text style={styles.text}>Cabecera activa: {cabeceraActiva}</Text>
+        )}
+
         {role === 'aeroclub' && (
           <>
             <Button title="Cambiar cabecera activa" onPress={cambiarCabecera} />
+
+            <Button
+              title="Autogenerar B1/B2"
+              disabled={!cabeceraA || !cabeceraB || !cabeceraActiva}
+              onPress={async () => {
+                if (!cabeceraA || !cabeceraB || !cabeceraActiva) return;
+                const { B1, B2 } = makeDefaultBeacons(cabeceraA, cabeceraB, cabeceraActiva);
+                setBeaconB1(B1);
+                setBeaconB2(B2);
+                await persistBeaconsAndEmit(B1, B2);
+              }}
+            />
+
             <Button
               title={modoSeteo ? 'Cancelar Seteo de Pista' : 'Setear nueva pista'}
               onPress={() => {
                 setCabeceraA(null);
                 setCabeceraB(null);
                 setCabeceraActiva(null);
+                setBeaconB1(null);            // ← limpiar beacons también
+                setBeaconB2(null);            // ← limpiar beacons también
                 setModoSeteo(!modoSeteo);
                 setNumeroPista('');
               }}
@@ -366,6 +540,7 @@ const cambiarCabecera = async () => {
           </>
         )}
       </View>
+
     </View>
   );
 }

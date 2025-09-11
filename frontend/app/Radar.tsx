@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { View, Text, StyleSheet, Dimensions, TouchableOpacity, Image, Alert, Platform, AppState, ScrollView } from 'react-native';
 import MapView, { Marker, PROVIDER_GOOGLE, Polyline } from 'react-native-maps';
 import Slider from '@react-native-community/slider';
@@ -9,7 +9,8 @@ import { getRemotePlaneIcon } from '../utils/getRemotePlaneIcon';
 import { normalizeModelToIcon } from '../utils/normalizeModelToIcon';
 import TrafficWarningCard from './components/TrafficWarningCard';
 import { Plane } from '../types/Plane';
-import { SERVER_URL } from '../utils/config'; // ajustá la ruta si es distinta
+export const BACKEND_URL = 'https://air-guardian-backend.onrender.com';
+export const SERVER_URL  = BACKEND_URL; // alias
 import io from "socket.io-client";
 import { socket } from '../utils/socket';
 //import { calcularWarningLocalMasPeligroso } from '../data/WarningSelector';
@@ -17,6 +18,8 @@ import { Warning } from '../data/FunctionWarning';
 import { useFocusEffect } from "@react-navigation/native";
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Airfield } from '../types/airfield';
+import * as Speech from 'expo-speech';
+
 
 
 
@@ -209,6 +212,10 @@ useEffect(() => {
 
 const [track, setTrack] = useState<LatLon[]>([]);
 const [traffic, setTraffic] = useState<Plane[]>([]);
+// Secuencia/slots (de sequence-update)
+const [slots, setSlots] = useState<Array<{opId:string; type:'ARR'|'DEP'; name:string; startMs:number; endMs:number; frozen:boolean;}>>([]);
+// Target de navegación que llega por ATC (o por tu lógica local)
+const [navTarget, setNavTarget] = useState<LatLon | null>(null);
 const mapRef = useRef<MapView | null>(null);
 const socketRef = useRef<ReturnType<typeof io> | null>(null);
 const isFocusedRef = useRef(false);
@@ -227,6 +234,24 @@ const runwayHeading = rw
 const runwayMid = (A_runway && B_runway)
   ? { latitude: (A_runway.latitude + B_runway.latitude) / 2, longitude: (A_runway.longitude + B_runway.longitude) / 2 }
   : null;
+
+    // === Beacons desde airfield (si existen) ===
+  const beaconB1 = useMemo<LatLon | null>(() => {
+    const arr = (rw as any)?.beacons as Array<{name:string; lat:number; lon:number}> | undefined;
+    const b1 = arr?.find(b => (b.name || '').toUpperCase() === 'B1');
+    return b1 ? { latitude: b1.lat, longitude: b1.lon } : null;
+  }, [rw]);
+
+  const beaconB2 = useMemo<LatLon | null>(() => {
+    const arr = (rw as any)?.beacons as Array<{name:string; lat:number; lon:number}> | undefined;
+    const b2 = arr?.find(b => (b.name || '').toUpperCase() === 'B2');
+    return b2 ? { latitude: b2.lat, longitude: b2.lon } : null;
+  }, [rw]);
+
+  const activeThreshold = useMemo<LatLon | null>(() => {
+    if (!rw) return null;
+    return rw.active_end === 'B' ? B_runway : A_runway;
+  }, [rw, A_runway, B_runway]);
 
 // === AG: helper para avisar que salimos ===
 const emitLeave = () => {
@@ -535,6 +560,12 @@ useFocusEffect(
         if (!cancelled && raw) {
           const af: Airfield = JSON.parse(raw);
           setAirfield(af);
+          // 👇 reenvía la pista activa al backend si hay socket conectado
+          const s = socketRef.current;
+          if (s && (s as any).connected) {
+            s.emit('airfield-upsert', { airfield: af });
+          }
+
         }
       } catch {}
     })();
@@ -824,13 +855,57 @@ useEffect(() => {
     }
 
 
-    s.on('connect', () => {
+    s.on('connect', async () => {
       console.log('🔌 Conectado al servidor WebSocket');
-      s.emit('get-traffic'); // <-- pedir tráfico ni bien conecta
-      s.emit('airfield-get');// 👉 pedir pista actual al backend
-      s.emit('runway-get'); // 👉 sincronizar estado de pista al conectar
+      s.emit('get-traffic');
+      s.emit('airfield-get');
+      s.emit('runway-get');
 
+      // === NUEVO: secuencia y beacons desde el backend
+      s.on('sequence-update', (msg: any) => {
+        try {
+          if (Array.isArray(msg?.slots)) setSlots(msg.slots);
+          // Si el backend manda beacons, podés pintarlos aquí también:
+          // const b1 = msg?.beacons?.B1; const b2 = msg?.beacons?.B2;
+          // (si querés mostrarlos, convertí a {latitude,longitude} y dibujalos)
+        } catch {}
+      });
+
+      // === NUEVO: instrucciones dirigidas (ATC) ===
+      s.on('atc-instruction', (instr: any) => {
+        if (!instr?.type) return;
+
+        if (instr.type === 'goto-beacon' && typeof instr.lat === 'number' && typeof instr.lon === 'number') {
+          setNavTarget({ latitude: instr.lat, longitude: instr.lon });
+          flashBanner(instr.text || 'Proceda al beacon', 'atc-goto');
+          try { Speech.stop(); Speech.speak('Proceda al beacon', { language: 'es-ES' }); } catch {}
+        }
+
+        if (instr.type === 'turn-to-B1') {
+          // Si ya tenés beacon B1 local derivado del airfield, podés usarlo
+          // setNavTarget(beaconB1); // si tenés beaconB1 calculado
+          flashBanner(instr.text || 'Vire hacia B1', 'atc-b1');
+          try { Speech.stop(); Speech.speak('Vire hacia be uno', { language: 'es-ES' }); } catch {}
+        }
+
+        if (instr.type === 'cleared-to-land') {
+          // Mantener navTarget al umbral si querés (si ya lo seteás en otro lado, podés no tocarlo)
+          flashBanner((instr.text || 'Autorizado a aterrizar') + (instr.rwy ? ` pista ${instr.rwy}` : ''), 'atc-clr');
+          try { Speech.stop(); Speech.speak((instr.text || 'Autorizado a aterrizar') + (instr.rwy ? ` pista ${instr.rwy}` : ''), { language: 'es-ES' }); } catch {}
+        }
+      });
+
+
+      // 👇 si el server no tiene pista cargada, reinyectala desde AsyncStorage
+      try {
+        const raw = await AsyncStorage.getItem('airfieldActive');
+        if (raw) {
+          const af = JSON.parse(raw);
+          s.emit('airfield-upsert', { airfield: af });
+        }
+      } catch {}
     });
+
 
     s.on('conflicto', (data: any) => {
       console.log('⚠️ Conflicto recibido vía WebSocket:', data);
@@ -964,11 +1039,21 @@ useEffect(() => {
       setRunwayState(payload);
     });
 
-    // Banner de turno / mensajes desde el backend (6 s con anti-spam)
+    // Banner de turno + VOZ (6 s con anti-spam)
     s.on('runway-msg', (m: any) => {
       if (!m?.text) return;
-      // usá flashBanner para integrarlo con tu UI efímera
+
+      // 1) Banner en UI
       flashBanner(m.text, `srv:${m.key || m.text}`);
+
+      // 2) Texto a voz (castellano). Ej: “#3” -> “número 3”
+      try {
+        const spoken = String(m.text)
+          .replace(/#\s*(\d+)/g, 'número $1')
+          .replace(/^Tu /i, 'Su ');
+        Speech.stop();
+        Speech.speak(spoken, { language: 'es-ES', rate: 1.0, pitch: 1.0 });
+      } catch {}
     });
 
 
@@ -1101,6 +1186,9 @@ useEffect(() => {
       s.off('airfield-update');
       s.off('runway-state');
       s.off('runway-msg');
+      s.off('sequence-update');
+      s.off('atc-instruction');
+
 
 
       // si compartís un socket global, NO lo desconectes aquí
@@ -1390,6 +1478,58 @@ if (firstLanding?.name === me && !st.inUse && defaultActionForMe() === 'land') {
   }
 }, [myPlane.lat, myPlane.lon, myPlane.alt, myPlane.speed, runwayState, rw]);
 
+  // === NAV: guía simple con B2 → B1 → Umbral, según turno en cola (con voz) ===
+  useEffect(() => {
+    if (!rw || !beaconB1 || !beaconB2) { setNavTarget(null); return; }
+    // Sólo guiamos si pediste aterrizaje y estás “volando”
+    if (!landingRequestedRef.current || defaultActionForMe() !== 'land') {
+      setNavTarget(null);
+      return;
+    }
+
+    const me = myPlane?.id || username;
+    const landings = runwayState?.state?.landings || [];
+    const idx = landings.findIndex((x:any) => x?.name === me);
+
+    if (idx === -1) { setNavTarget(null); return; }
+
+    // Si NO soy #1 → me mando a B2
+    if (idx > 0) {
+      if (!navTarget || navTarget.latitude !== beaconB2.latitude || navTarget.longitude !== beaconB2.longitude) {
+        setNavTarget(beaconB2);
+        flashBanner('Proceda a B2', 'goto-b2');
+        try { Speech.stop(); Speech.speak('Proceda a be dos', { language: 'es-ES', rate: 1.0, pitch: 1.0 }); } catch {}
+      }
+      return;
+    }
+
+    // Soy #1 → voy a B1; si estoy muy cerca de B1, apunto al umbral activo
+    const dToB1 = getDistance(myPlane.lat, myPlane.lon, beaconB1.latitude, beaconB1.longitude);
+    if (dToB1 > 800) {
+      if (!navTarget || navTarget.latitude !== beaconB1.latitude || navTarget.longitude !== beaconB1.longitude) {
+        setNavTarget(beaconB1);
+        flashBanner('Vire hacia B1', 'turn-b1');
+        try { Speech.stop(); Speech.speak('Vire hacia be uno', { language: 'es-ES', rate: 1.0, pitch: 1.0 }); } catch {}
+      }
+    } else if (activeThreshold) {
+      if (!navTarget || navTarget.latitude !== activeThreshold.latitude || navTarget.longitude !== activeThreshold.longitude) {
+        setNavTarget(activeThreshold);
+        // El “permiso para aterrizar” lo manejás en otro effect; aquí solo guía.
+        flashBanner('Continúe a final', 'continue-final');
+        try { Speech.stop(); Speech.speak('Continúe a final', { language: 'es-ES', rate: 1.0, pitch: 1.0 }); } catch {}
+      }
+    }
+  }, [
+    rw,
+    runwayState,          // cambia cuando se replanifica la cola
+    beaconB1, beaconB2,
+    activeThreshold,
+    myPlane.lat, myPlane.lon,
+    username,
+    navTarget
+  ]);
+
+
 
   useEffect(() => {
     return () => {
@@ -1558,6 +1698,52 @@ if (firstLanding?.name === me && !st.inUse && defaultActionForMe() === 'land') {
           {/* === FIN RUNWAY === */}
 
         <Polyline coordinates={track} strokeColor="blue" strokeWidth={2} />
+
+        {/* === BEACONS: Línea guía B2 -> B1 -> Umbral activo === */}
+        {beaconB1 && beaconB2 && (
+          <Polyline
+            coordinates={[
+              beaconB2,
+              beaconB1,
+              activeThreshold || beaconB1
+            ]}
+            strokeColor="green"
+            strokeWidth={2}
+          />
+        )}
+        {/* B2 */}
+        {beaconB2 && (
+          <Marker coordinate={beaconB2} title="B2">
+            <View style={{ backgroundColor: '#673AB7', padding: 2, borderRadius: 10, minWidth: 24, alignItems: 'center' }}>
+              <Text style={{ color: 'white', fontWeight: 'bold', fontSize: 10 }}>B2</Text>
+            </View>
+          </Marker>
+        )}
+
+        {/* B1 */}
+        {beaconB1 && (
+          <Marker coordinate={beaconB1} title="B1">
+            <View style={{ backgroundColor: '#4CAF50', padding: 2, borderRadius: 10, minWidth: 24, alignItems: 'center' }}>
+              <Text style={{ color: 'white', fontWeight: 'bold', fontSize: 10 }}>B1</Text>
+            </View>
+          </Marker>
+        )}
+        {/* Mi pierna hacia el target (B2/B1/Umbral) */}
+        {navTarget && (
+          <Polyline
+            coordinates={[
+              { latitude: myPlane.lat, longitude: myPlane.lon },
+              navTarget
+            ]}
+            strokeColor="blue"
+            strokeWidth={2}
+          />
+        )}
+
+
+
+
+
       </MapView>
 
       <View style={styles.controlsBox}>
@@ -1762,7 +1948,16 @@ if (firstLanding?.name === me && !st.inUse && defaultActionForMe() === 'land') {
     position:'absolute', left:10, right:10, bottom: Platform.OS==='android'? 270 : 240,
     backgroundColor:'#263238', borderRadius:12, padding:10, elevation:4
   }}>
-    <Text style={{color:'#fff', textAlign:'center', fontWeight:'700'}}>{banner.text}</Text>
+    <Text
+        style={{
+          color: '#C62828',      // rojo
+          textAlign: 'center',
+          fontWeight: '900',
+          fontSize: 22,          // más grande
+        }}
+      >
+        {banner.text}
+    </Text>
   </View>
 )}
 
