@@ -131,6 +131,11 @@ const WAKE_EXTRA = {
   GLIDER:    { GLIDER:0,  LIGHT:0,  TURBOPROP:0,  JET_LIGHT:0,  JET_MED:0,  HEAVY:0  },
 };
 
+// Fallbacks si no te pasan slotMin desde el cliente
+const MIN_LDG_SEP_MIN = 2; // aterrizaje: 2 min
+const TKOF_OCCUPY_MIN = 2; // despegue: 2 min
+
+
 // Utilidades geográficas (bearing/destino)
 function bearingDeg(lat1, lon1, lat2, lon2) {
   const φ1 = toRad(lat1), φ2 = toRad(lat2);
@@ -229,6 +234,17 @@ function assignBeaconsFor(name) {
   }
   return asg;
 }
+
+// Velocidad sobre tierra en m/s tomada del último update del usuario.
+// Usa mínimo 30 km/h para evitar 0 al calcular ETA.
+function estimateGSms(name) {
+  const u = userLocations[name];
+  if (!u) return null;
+  const kmh = typeof u.speed === 'number' ? u.speed : 0;
+  const safeKmh = Math.max(30, kmh);
+  return (safeKmh * 1000) / 3600;
+}
+
 
 // ========= ETAs y freeze =========
 function computeETAtoPointSeconds(name, pt) {
@@ -481,6 +497,7 @@ function publishRunwayState() {
   const slots = runwayState.timelineSlots || [];
   const airfield = lastAirfield || null;
 
+  // Compatibilidad con tu UI actual (timeline simple de aterrizajes)
   const timelineCompat = slots
     .filter(s => s.type === 'ARR')
     .map(s => ({
@@ -501,8 +518,23 @@ function publishRunwayState() {
     },
   });
 
-  publishSequenceUpdate();
+  // Secuencia “avanzada” + beacons para guiar
+  const g = activeRunwayGeom();
+  io.emit('sequence-update', {
+    serverTime: now,
+    airfield,
+    beacons: g ? { B1: g.B1, B2: g.B2 } : null,
+    slots: slots.map(s => ({
+      opId: s.opId,
+      type: s.type,
+      name: (s.opId || '').split('#')[1],
+      startMs: s.startMs,
+      endMs: s.endMs,
+      frozen: s.frozen,
+    })),
+  });
 }
+
 
 
 

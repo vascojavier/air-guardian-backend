@@ -438,7 +438,7 @@ const defaultActionForMe = () => {
 
 // === RUNWAY: pedidos al backend ===
 const requestLanding = () => {
-  socketRef.current?.emit('runway-request', {
+  const payload = {
     action: 'land',
     name: myPlane?.id || username,
     callsign: callsign || '',
@@ -446,40 +446,49 @@ const requestLanding = () => {
     type: aircraftModel || '',
     emergency: !!(myPlane as any)?.emergency,
     altitude: myPlane?.alt ?? 0,
-  });
+  };
+  console.log('[RUNWAY] requestLanding →', payload);
+  socketRef.current?.emit('runway-request', payload);
+  socketRef.current?.emit('runway-get');
+  setTimeout(() => socketRef.current?.emit('runway-get'), 300);
 };
 
 const requestTakeoff = (ready: boolean) => {
-  socketRef.current?.emit('runway-request', {
+  const payload = {
     action: 'takeoff',
     name: myPlane?.id || username,
     callsign: callsign || '',
     aircraft: aircraftModel || '',
     type: aircraftModel || '',
     ready: !!ready,
-  });
+  };
+  console.log('[RUNWAY] requestTakeoff →', payload);
+  socketRef.current?.emit('runway-request', payload);
+  socketRef.current?.emit('runway-get');
+  setTimeout(() => socketRef.current?.emit('runway-get'), 300);
 };
 
 const cancelMyRequest = () => {
-  socketRef.current?.emit('runway-cancel', {
-    name: myPlane?.id || username,
-  });
+  const payload = { name: myPlane?.id || username };
+  console.log('[RUNWAY] cancel →', payload);
+  socketRef.current?.emit('runway-cancel', payload);
+  socketRef.current?.emit('runway-get');
 };
 
-// === RUNWAY: ocupar / liberar pista ===
 const markRunwayOccupy = (action: 'landing' | 'takeoff' | any) => {
   socketRef.current?.emit('runway-occupy', {
     action,
     name: myPlane?.id || username,
     callsign: callsign || '',
-    // slotMin opcional (si no, el server usa 5)
-    // slotMin: action === 'takeoff' ? 5 : 5,
   });
+  socketRef.current?.emit('runway-get');
 };
 
 const markRunwayClear = () => {
   socketRef.current?.emit('runway-clear');
+  socketRef.current?.emit('runway-get');
 };
+
 
 // === RUNWAY: wrappers para setear flags y banners ===
 const requestLandingLabel = () => {
@@ -907,50 +916,54 @@ useEffect(() => {
     });
 
 
-    s.on('conflicto', (data: any) => {
-      console.log('⚠️ Conflicto recibido vía WebSocket:', data);
-      const matchingPlane = planes.find(p => p.id === data.name || p.name === data.name);
-      if (!matchingPlane) return;
+s.on('conflicto', (data: any) => {
+  console.log('⚠️ Conflicto recibido vía WebSocket:', data);
 
-      const distNow =
-      typeof data.distance === 'number'
-      ? data.distance
-      : getDistance(myPlane.lat, myPlane.lon, matchingPlane.lat, matchingPlane.lon);
+  const match =
+    planes.find(p => p.id === data.id || p.id === data.name || p.name === data.name) || null;
 
-      // persistí la última distancia “oficial” que viene del emisor
-      backendDistanceRef.current[matchingPlane.id] = distNow;
+  const distNow =
+    typeof data.distanceMeters === 'number' ? data.distanceMeters :
+    typeof data.distance === 'number'       ? data.distance :
+    (match && myPlane
+      ? getDistance(myPlane.lat, myPlane.lon, match.lat, match.lon)
+      : NaN);
 
-            // si el warning fijado es este mismo avión, refrescar al toque
-      setPrioritizedWarning(prev =>
-        prev && prev.id === matchingPlane.id
-          ? { ...prev, distanceMeters: distNow }
-          : prev
-      );
+  if (match) {
+    backendDistanceRef.current[match.id] = distNow;
+  }
 
-      const enrichedWarning: Warning = {
-        id: matchingPlane.id,
-        name: matchingPlane.name,
-        lat: matchingPlane.lat,
-        lon: matchingPlane.lon,
-        alt: matchingPlane.alt,
-        heading: matchingPlane.heading,
-        speed: matchingPlane.speed,
-        alertLevel: data.type === 'RA' ? 'RA_LOW' : 'TA',
-        timeToImpact: data.timeToImpact ?? 999,  // ✅ usar lo que vino del avión emisor
-        distanceMeters: distNow, // ← usa lo que mandó el emisor
-        aircraftIcon: matchingPlane.aircraftIcon,
-        callsign: matchingPlane.callsign,
-      };
+  // Si la tarjeta pinneada es este mismo avión, refrescá la distancia al toque
+  setPrioritizedWarning(prev =>
+    prev && (prev.id === (match?.id ?? data.id ?? data.name))
+      ? { ...prev, distanceMeters: distNow }
+      : prev
+  );
 
+  const level = (data.alertLevel === 'RA_HIGH' || data.alertLevel === 'RA_LOW' || data.alertLevel === 'TA')
+    ? data.alertLevel
+    : (data.type === 'RA' ? 'RA_LOW' : 'TA');
 
-      setWarnings(prev => ({
-        ...prev,
-        [enrichedWarning.id]: enrichedWarning,
-      }));
+  const enrichedWarning: Warning = {
+    id: match?.id ?? data.id ?? data.name,
+    name: match?.name ?? data.name,
+    lat: match?.lat ?? data.lat,
+    lon: match?.lon ?? data.lon,
+    alt: match?.alt ?? data.alt,
+    heading: match?.heading ?? data.heading,
+    speed: match?.speed ?? data.speed,
+    alertLevel: level,
+    timeToImpact: typeof data.timeToImpact === 'number' ? data.timeToImpact : 999,
+    distanceMeters: distNow,
+    aircraftIcon: match?.aircraftIcon ?? data.aircraftIcon ?? '2.png',
+    callsign: match?.callsign ?? data.callsign ?? '',
+    type: match?.type ?? data.type,
+  };
 
-      setBackendWarning(enrichedWarning);
+  setWarnings(prev => ({ ...prev, [enrichedWarning.id]: enrichedWarning }));
+  setBackendWarning(enrichedWarning);
+});
 
-    });
 
     s.on('traffic-update', (data: any) => {
       if (Array.isArray(data)) {
@@ -1036,8 +1049,10 @@ useEffect(() => {
 
     // --- RUNWAY: estado de pista en tiempo real ---
     s.on('runway-state', (payload: any) => {
+      try { console.log('[RUNWAY] state ←', JSON.stringify(payload)); } catch {}
       setRunwayState(payload);
     });
+
 
     // Banner de turno + VOZ (6 s con anti-spam)
     s.on('runway-msg', (m: any) => {
