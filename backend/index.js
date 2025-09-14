@@ -80,7 +80,7 @@ function getDistance(lat1, lon1, lat2, lon2) {
   // Emite a todos un "sequence-update" con slots y beacons
   function publishSequenceUpdate() {
     const beacons = getActiveBeacons();
-    const slots = (runwayState.timeline || []).map(s => ({
+    const slots = (runwayState.timelineSlots || []).map(s => ({
       opId: `${s.action === 'landing' ? 'ARR' : 'DEP'}#${s.name}`,
       type: s.action === 'landing' ? 'ARR' : 'DEP',
       name: s.name,
@@ -450,66 +450,54 @@ function maybeSendInstruction(opId, opsById) {
 }
 
 // ========= Publicación de estado =========
-function publishRunwayState() {
-  const now = Date.now();
-  const { slots } = { slots: runwayState.timelineSlots || [] };
-  const airfield = lastAirfield || null;
+  function publishRunwayState() {
+    const now = Date.now();
+    const slots = runwayState.timelineSlots || [];
+    const airfield = lastAirfield || null;
 
-  // Para compatibilidad: timeline “simple” de aterrizajes (como antes)
-  const timelineCompat = slots
-    .filter(s => s.type === 'ARR')
-    .map(s => ({
-      action: 'landing',
+    // Compatibilidad: timeline “simple” de ARR para el cartel del Radar
+    const timelineCompat = slots
+      .filter(s => s.type === 'ARR')
+      .map(s => ({
+        action: 'landing',
+        name: (s.opId || '').split('#')[1],
+        at: new Date(s.startMs),
+        slotMin: Math.round((s.endMs - s.startMs) / 60000),
+      }));
+
+    // ⚠️ IMPORTANTE: guardar también en memoria para quienes lean runwayState.timeline
+    runwayState.timeline = timelineCompat;
+
+    // Emit clásico que consume Radar.tsx
+    io.emit('runway-state', {
+      airfield,
+      state: {
+        landings: runwayState.landings,
+        takeoffs: runwayState.takeoffs,
+        inUse: runwayState.inUse,
+        timeline: timelineCompat,
+        serverTime: now,
+      },
+    });
+
+    // Secuencia completa (slots crudos) + beacons
+    const payloadSlots = slots.map(s => ({
+      opId: s.opId,
+      type: s.type,
       name: (s.opId || '').split('#')[1],
-      at: new Date(s.startMs),
-      slotMin: Math.round((s.endMs - s.startMs)/60000)
+      startMs: s.startMs,
+      endMs: s.endMs,
+      frozen: s.frozen,
     }));
+    const g = activeRunwayGeom();
+    io.emit('sequence-update', {
+      serverTime: now,
+      airfield,
+      beacons: g ? { B1: g.B1, B2: g.B2 } : null,
+      slots: payloadSlots,
+    });
+  }
 
-  io.emit('runway-state', {
-    airfield,
-    state: {
-      landings: runwayState.landings,
-      takeoffs: runwayState.takeoffs,
-      inUse: runwayState.inUse,
-      timeline: timelineCompat,
-      serverTime: now
-    }
-  });
-
-  // Nuevo: slots completos para UI avanzada
-  const payloadSlots = slots.map(s => ({
-    opId: s.opId,
-    type: s.type,
-    name: (s.opId || '').split('#')[1],
-    startMs: s.startMs,
-    endMs: s.endMs,
-    frozen: s.frozen
-  }));
-  const g = activeRunwayGeom();
-  io.emit('sequence-update', {
-    serverTime: now,
-    airfield,
-    beacons: g ? { B1: g.B1, B2: g.B2 } : null,
-    slots: payloadSlots
-  });
-
-   function publishRunwayState() {
-   io.emit('runway-state', {
-     airfield: lastAirfield || null,
-     state: {
-       landings: runwayState.landings,
-       takeoffs: runwayState.takeoffs,
-       inUse: runwayState.inUse,
-       timeline: runwayState.timeline,
-       serverTime: Date.now()
-     }
-   });
-    +  // Además de runway-state, emitimos la secuencia normalizada con beacons
-    +  publishSequenceUpdate();
-    }
-
-
-}
 
 // ========= Ciclo principal =========
 function cleanupInUseIfDone() {
@@ -580,11 +568,14 @@ function planRunwaySequence() {
               text: 'Vire hacia B1',
             });
           } else {
-            // Cerca de B1 → si el slot más próximo es mío y pista libre → cleared to land
-            const mySlot = runwayState.timeline.find(s => s.action === 'landing' && s.name === l.name);
-            const slotMs = mySlot ? new Date(mySlot.at).getTime() : null;
-            const soon = slotMs ? (slotMs - Date.now()) <= 60000 : false; // <= 60s
-            const runwayFree = !runwayState.inUse;
+              // Cerca de B1 → si el slot más próximo es mío y pista libre → cleared to land
+              const mySlot = (runwayState.timelineSlots || []).find(
+                s => s.type === 'ARR' && s.opId === `ARR#${l.name}`
+              );
+              const slotMs = mySlot?.startMs || null;
+              const soon = slotMs ? (slotMs - Date.now()) <= 60000 : false; // <= 60s
+              const runwayFree = !runwayState.inUse;
+
 
             if (runwayFree && soon) {
               maybeEmitInstruction(l.name, {
@@ -746,45 +737,40 @@ io.on('connection', (socket) => {
 
 
   socket.on('warning', (warningData) => {
-    const sender = socketIdToName[socket.id];
-    if (!sender) return;
+    // Quién emite
+    const emitter = socketIdToName[socket.id];
+    if (!emitter) return;
 
-    const senderInfo = userLocations[sender];
-    if (!senderInfo) return;
+    // A quién va dirigido (el otro avión, por id/name)
+    const target = String(warningData.id || '').trim();
+    const targetSockId = userLocations[target]?.socketId;
+    if (!target || !targetSockId) return;
 
-    console.log(`⚠️ Warning recibido de ${sender}:`, warningData);
+    // Clasificación RA/TA (igual que usa el frontend)
+    const isRA =
+      String(warningData.alertLevel || '').toUpperCase().startsWith('RA') ||
+      String(warningData.type || '').toUpperCase() === 'RA';
 
-    const alertLevel =
-      warningData.alertLevel ||
-      (warningData.type === 'RA' && warningData.timeToImpact < 60
-        ? 'RA_HIGH'
-        : warningData.type === 'RA'
-        ? 'RA_LOW'
-        : 'TA');
-
-    const enrichedWarning = {
-      id: warningData.id || warningData.name,
-      name: warningData.name,
-      lat: warningData.lat,
-      lon: warningData.lon,
-      alt: warningData.alt ?? 0,
-      heading: warningData.heading ?? 0,
-      speed: warningData.speed ?? 0,
-      type: warningData.type || 'unknown',
-      timeToImpact: warningData.timeToImpact ?? 999,
-      alertLevel,
-      aircraftIcon: warningData.aircraftIcon ?? senderInfo.icon ?? '2.png',
-      callsign: warningData.callsign ?? senderInfo.callsign ?? '',
+    const payloadForTarget = {
+      // IMPORTANTÍSIMO: el frontend espera 'name' = QUIÉN ME VE EN CONFLICTO
+      name: emitter,
+      type: isRA ? 'RA' : 'TA',
+      timeToImpact: typeof warningData.timeToImpact === 'number' ? warningData.timeToImpact : 999,
+      distance: typeof warningData.distanceMeters === 'number' ? warningData.distanceMeters : undefined,
     };
 
-    console.log(`📤 Enviando enrichedWarning a otros usuarios:`, enrichedWarning);
+    // → solo al otro avión
+    io.to(targetSockId).emit('conflicto', payloadForTarget);
 
-    for (const [name, info] of Object.entries(userLocations)) {
-      if (name !== sender && info.socketId) {
-        io.to(info.socketId).emit('conflicto', enrichedWarning);
-      }
-    }
+    // Eco opcional al emisor (para fijar tarjeta simétrica)
+    socket.emit('conflicto', {
+      name: target,
+      type: payloadForTarget.type,
+      timeToImpact: payloadForTarget.timeToImpact,
+      distance: payloadForTarget.distance,
+    });
   });
+
 
   // (1) Manejar air-guardian/leave
   socket.on('air-guardian/leave', () => {
