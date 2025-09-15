@@ -714,22 +714,27 @@ io.on('connection', (socket) => {
 
     console.log('🗺️ Estado actual de userLocations:', userLocations);
 
-    const trafficData = Object.values(userLocations)
-      .filter(u => u.name !== name)
-      .map((info) => ({
-        name: info.name,
-        lat: info.latitude,
-        lon: info.longitude,
-        alt: info.alt,
-        heading: info.heading,
-        type: info.type,
-        speed: info.speed,
-        callsign: info.callsign,
-        aircraftIcon: info.icon
-      }));
+for (const [recvName, info] of Object.entries(userLocations)) {
+  if (!info?.socketId) continue;
 
-    console.log('📡 Emitiendo tráfico:', trafficData);
-    socket.emit('traffic-update', trafficData);
+  const list = Object.values(userLocations)
+    .filter(u => u.name !== recvName) // cada uno recibe “todos menos yo”
+    .map(u => ({
+      name: u.name,
+      lat: u.latitude,
+      lon: u.longitude,
+      alt: u.alt,
+      heading: u.heading,
+      type: u.type,
+      speed: u.speed,
+      callsign: u.callsign,
+      aircraftIcon: u.icon
+    }));
+  console.log('📡 Emitiendo tráfico:', trafficData);
+  io.to(info.socketId).emit('traffic-update', list);
+}
+
+    
 
     // ►► (AGREGADO) replanificar si hay solicitudes pendientes y cambió la kinemática
     if (runwayState.landings.length || runwayState.takeoffs.length) {
