@@ -730,7 +730,7 @@ for (const [recvName, info] of Object.entries(userLocations)) {
       callsign: u.callsign,
       aircraftIcon: u.icon
     }));
-  console.log('📡 Emitiendo tráfico:', trafficData);
+  
   io.to(info.socketId).emit('traffic-update', list);
 }
 
