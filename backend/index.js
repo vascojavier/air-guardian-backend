@@ -818,35 +818,61 @@ socket.on('warning', (warningData) => {
     type: warningData.aircraftType || warningData.type || 'unknown',
   };
 
-  for (const [name, info] of Object.entries(userLocations)) {
-    if (name !== sender && info.socketId) {
-      io.to(info.socketId).emit('conflicto', enrichedWarning);
+    // ✅ Broadcast personalizado por receptor (RA espejado para el target)
+    for (const [recvName, recvInfo] of Object.entries(userLocations)) {
+      if (recvName === sender || !recvInfo?.socketId) continue;
+
+      const targetName = enrichedWarning.name;              // el “otro” que mandó el emisor
+      const otherName  = (recvName === targetName) ? sender : targetName;
+
+      const other = userLocations[otherName];
+      const me    = userLocations[recvName];
+      if (!other || !me) continue;
+
+      // ¿RA o TA?
+      const isRA = alertLevel === 'RA_HIGH' || alertLevel === 'RA_LOW';
+
+      // Distancia entre el receptor y el “otro”
+      const distance = getDistance(me.latitude, me.longitude, other.latitude, other.longitude);
+
+      const payload = {
+        id: otherName,
+        name: otherName,
+        lat: other.latitude,
+        lon: other.longitude,
+        alt: other.alt,
+        heading: other.heading,
+        speed: other.speed,
+        // IMPORTANTE: tu frontend chequea data.type === 'RA'
+        type: isRA ? 'RA' : 'TA',
+        alertLevel,                       // además mandamos el nivel exacto
+        timeToImpact: enrichedWarning.timeToImpact,
+        distance,                         // útil para refrescos en UI
+        aircraftIcon: other.icon || '2.png',
+        callsign: other.callsign || '',
+      };
+
+      io.to(recvInfo.socketId).emit('conflicto', payload);
     }
-  }
+  });
 
-  // Espejo dirigido: al “otro” (objetivo) mandarle RA contra el emisor
-  const otherName = warningData.id || warningData.name;
-  const otherInfo = userLocations[otherName];
-  if (otherInfo?.socketId) {
-    const mirror = {
-      id: sender,
-      name: sender,
-      lat: senderInfo.latitude,
-      lon: senderInfo.longitude,
-      alt: senderInfo.alt,
-      heading: senderInfo.heading,
-      speed: senderInfo.speed,
-      alertLevel: level,
-      kind: level.startsWith('RA') ? 'RA' : 'TA',
-      timeToImpact: warningData.timeToImpact ?? 999,
-      aircraftIcon: senderInfo.icon || '2.png',
-      callsign: senderInfo.callsign || '',
-      type: senderInfo.type || 'unknown',
-    };
-    io.to(otherInfo.socketId).emit('conflicto', mirror);
-  }
-});
 
+  socket.on('warning-clear', (msg) => {
+    const sender = socketIdToName[socket.id];   // quién está avisando el clear
+    if (!sender) return;
+
+    const target = String(msg?.id || '');       // contra quién fue el RA original
+    if (!target) return;
+
+    for (const [recvName, info] of Object.entries(userLocations)) {
+      if (recvName === sender || !info?.socketId) continue;
+
+      // espejo: si el receptor es el target, debe limpiar al sender; si no, limpia al target
+      const otherName = (recvName === target) ? sender : target;
+
+      io.to(info.socketId).emit('conflicto-clear', { id: otherName });
+    }
+  });
 
 
   // (1) Manejar air-guardian/leave
