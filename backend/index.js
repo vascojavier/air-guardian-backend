@@ -237,14 +237,6 @@ function assignBeaconsFor(name) {
 
 // Velocidad sobre tierra en m/s tomada del último update del usuario.
 // Usa mínimo 30 km/h para evitar 0 al calcular ETA.
-function estimateGSms(name) {
-  const u = userLocations[name];
-  if (!u) return null;
-  const kmh = typeof u.speed === 'number' ? u.speed : 0;
-  const safeKmh = Math.max(30, kmh);
-  return (safeKmh * 1000) / 3600;
-}
-
 
 // ========= ETAs y freeze =========
 function computeETAtoPointSeconds(name, pt) {
@@ -835,7 +827,8 @@ socket.on('warning', (warningData) => {
       if (!other || !me) continue;
 
       // ¿RA o TA?
-      const isRA = alertLevel === 'RA_HIGH' || alertLevel === 'RA_LOW';
+     const isRA = level === 'RA_HIGH' || level === 'RA_LOW';
+
 
       // Distancia entre el receptor y el “otro”
       const distance = getDistance(me.latitude, me.longitude, other.latitude, other.longitude);
@@ -850,7 +843,7 @@ socket.on('warning', (warningData) => {
         speed: other.speed,
         // IMPORTANTE: tu frontend chequea data.type === 'RA'
         type: isRA ? 'RA' : 'TA',
-        alertLevel,                       // además mandamos el nivel exacto
+        alertLevel: level,                  // además mandamos el nivel exacto
         timeToImpact: enrichedWarning.timeToImpact,
         distance,                         // útil para refrescos en UI
         aircraftIcon: other.icon || '2.png',
@@ -1001,7 +994,8 @@ socket.on('warning', (warningData) => {
           name,
           callsign: callsign || '',
           startedAt: Date.now(),
-          slotMin: slotMin || 5, // 5 min por defecto
+          slotMin: slotMin || (action === 'takeoff' ? TKOF_OCCUPY_MIN : MIN_LDG_SEP_MIN)
+
 
         };
       }
