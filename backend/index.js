@@ -106,7 +106,7 @@ function getDistance(lat1, lon1, lat2, lon2) {
 const NM_TO_M = 1852;
 const B1_DIST_NM = 3.5;       // ~3–4 NM
 const B2_DIST_NM = 7.0;       // ~6–8 NM
-const B1_FREEZE_RADIUS_M = 1200;   // a este radio de B1 se congela el turno
+const B1_FREEZE_RADIUS_M = 2500;   // a este radio de B1 se congela el turno
 const BEACON_REACHED_M = 600;      // umbral para considerar “llegó” a un beacon
 const INTERLEAVE_WINDOW_S = 120;   // ventana de intercalado ±2 min
 const MAX_DELAY_SHIFT_S = 60;      // máximo corrimiento permitido de slots no-frozen
