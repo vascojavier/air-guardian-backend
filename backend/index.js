@@ -78,23 +78,23 @@ function getDistance(lat1, lon1, lat2, lon2) {
   }
 
   // Emite a todos un "sequence-update" con slots y beacons
-function publishSequenceUpdate() {
-  const g = activeRunwayGeom();
-  const slots = (runwayState.timelineSlots || []).map(s => ({
-    opId: s.opId,
-    type: s.type,
-    name: (s.opId || '').split('#')[1],
-    startMs: s.startMs,
-    endMs: s.endMs,
-    frozen: s.frozen,
-  }));
-  io.emit('sequence-update', {
-    serverTime: Date.now(),
-    airfield: lastAirfield || null,
-    beacons: g ? { B1: g.B1, B2: g.B2 } : null,
-    slots,
-  });
-}
+// function publishSequenceUpdate() {
+//   const g = activeRunwayGeom();
+//   const slots = (runwayState.timelineSlots || []).map(s => ({
+//     opId: s.opId,
+//     type: s.type,
+//     name: (s.opId || '').split('#')[1],
+//     startMs: s.startMs,
+//     endMs: s.endMs,
+//     frozen: s.frozen,
+//   }));
+//   io.emit('sequence-update', {
+//     serverTime: Date.now(),
+//     airfield: lastAirfield || null,
+//     beacons: g ? { B1: g.B1, B2: g.B2 } : null,
+//     slots,
+//   });
+// }
 
 
 
@@ -186,6 +186,13 @@ const runwayState = {
   timelineSlots: [], // [{opId, type:'ARR'|'DEP', startMs, endMs, frozen}]
   lastOrder: { landings: [], takeoffs: [] },
 };
+
+// Guarda el corrimiento total aplicado a cada slot (opId) en ms
+const shiftAccumMsByOpId = new Map();
+// Último mapa de operaciones (para enriquecer sequence-update)
+let lastOpsById = new Map();
+
+
 // memoria para asignaciones e instrucciones ATC
 const approachAssign = new Map(); // name -> { b1:{lat,lon}, b2:{lat,lon} }
 const lastInstr = new Map();      // name -> { phase:'B2'|'B1'|'CLRD', ts:number }
@@ -340,33 +347,47 @@ function buildOperations(nowMs) {
 
 function tryShiftChain(slots, startIdx, shiftMs, opsById) {
   // intenta correr slots [startIdx..] hacia adelante respetando MAX_DELAY_SHIFT y frozen
-  let carry = shiftMs;
-  for (let i = startIdx; i < slots.length; i++) {
-    const s = slots[i];
-    if (s.frozen) return false; // no se puede
-    const allowed = MAX_DELAY_SHIFT_S * 1000;
-    const newStart = s.startMs + carry;
-    const newEnd   = s.endMs   + carry;
-    // ¿respeta su propio límite?
-    if ((newStart - s.startMs) > allowed) return false;
-    // chequear wake con el anterior (i-1 ya está ajustado si i>startIdx)
-    if (i > 0) {
-      const prev = slots[i-1];
-      const prevOp = opsById.get(prev.opId);
-      const currOp = opsById.get(s.opId);
-      const extra = wakeExtraSeconds(prevOp.category, currOp.category) * 1000;
-      if (newStart < prev.endMs + extra) {
-        // necesita más shift; acumularlo
-        carry += (prev.endMs + extra) - newStart;
-      }
+let carry = shiftMs;
+for (let i = startIdx; i < slots.length; i++) {
+  const s = slots[i];
+  if (s.frozen) return false;
+
+  const prevStart = s.startMs;
+  const allowed = MAX_DELAY_SHIFT_S * 1000;
+
+  // Corrimiento propuesto para este slot
+  let newStart = s.startMs + carry;
+  let newEnd   = s.endMs   + carry;
+
+  // Respeto wake con el anterior (si i>startIdx, el anterior ya está ajustado)
+  if (i > 0) {
+    const prev = slots[i-1];
+    const prevOp = opsById.get(prev.opId);
+    const currOp = opsById.get(s.opId);
+    const extra = wakeExtraSeconds(prevOp.category, currOp.category) * 1000;
+    if (newStart < prev.endMs + extra) {
+      carry += (prev.endMs + extra) - newStart;
+      newStart = s.startMs + carry;
+      newEnd   = s.endMs   + carry;
     }
-    s.startMs = newStart;
-    s.endMs = newEnd;
   }
-  return true;
+
+  // Límite por acumulado histórico (por opId)
+  const acc = shiftAccumMsByOpId.get(s.opId) || 0;
+  const deltaThis = newStart - s.startMs; // delta de este paso
+  if ((acc + deltaThis) > allowed) return false;
+
+  // Aplicar
+  s.startMs = newStart;
+  s.endMs   = newEnd;
+  shiftAccumMsByOpId.set(s.opId, acc + deltaThis);
+}
+return true;
+
 }
 
 function planificar(nowMs) {
+  shiftAccumMsByOpId.clear();
   const now = nowMs ?? Date.now();
   const ops = buildOperations(now);
   const opsById = new Map(ops.map(o => [o.id, o]));
@@ -434,6 +455,8 @@ function planificar(nowMs) {
   }
 
   runwayState.timelineSlots = slots;
+  lastOpsById = opsById;
+
   return { slots, opsById };
 }
 
@@ -445,43 +468,55 @@ function emitToUser(name, event, payload) {
 function maybeSendInstruction(opId, opsById) {
   const op = opsById.get(opId);
   if (!op || op.type !== 'ARR') return;
+
   const asg = assignBeaconsFor(op.name);
   if (!asg) return;
 
   const u = userLocations[op.name];
   if (!u) return;
 
+  const mySlot = runwayState.timelineSlots.find(s => s.opId === opId);
+  const now = Date.now();
+  const dt = mySlot ? (mySlot.startMs - now) : null;
+
   const dB2 = getDistance(u.latitude, u.longitude, asg.b2.lat, asg.b2.lon);
   const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
   const mem = lastInstr.get(op.name) || { phase: null, ts: 0 };
 
+  // 1) Pre-secuencia: si está fuera de B2 -> ir a B2
   if (dB2 > BEACON_REACHED_M) {
     if (mem.phase !== 'B2') {
       emitToUser(op.name, 'atc-instruction', {
-        type: 'goto-beacon', beacon: 'B2', lat: asg.b2.lat, lon: asg.b2.lon,
+        type: 'goto-beacon',
+        beacon: 'B2',
+        lat: asg.b2.lat, lon: asg.b2.lon,
         text: 'Proceda a B2'
       });
-      lastInstr.set(op.name, { phase: 'B2', ts: Date.now() });
+      lastInstr.set(op.name, { phase: 'B2', ts: now });
     }
     return;
   }
-  if (dB1 > BEACON_REACHED_M) {
+
+  // 2) Ventana de giro a B1: ~90s antes del slot (si aún no llegó a B1)
+  if (dt != null && dt <= 90000 && dB1 > BEACON_REACHED_M) {
     if (mem.phase !== 'B1') {
       emitToUser(op.name, 'atc-instruction', { type: 'turn-to-B1', text: 'Vire hacia B1' });
-      lastInstr.set(op.name, { phase: 'B1', ts: Date.now() });
+      lastInstr.set(op.name, { phase: 'B1', ts: now });
     }
     return;
   }
-  // cerca de B1 → cleared cuando llegue su turno (≤45 s)
-  const mySlot = runwayState.timelineSlots.find(s => s.opId === opId);
-  if (mySlot) {
-    const dt = mySlot.startMs - Date.now();
-    if (dt <= 45000 && mem.phase !== 'CLRD') {
-      emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: activeRunwayGeom()?.rw?.ident || '', text: 'Autorizado a aterrizar' });
-      lastInstr.set(op.name, { phase: 'CLRD', ts: Date.now() });
+
+  // 3) Cleared-to-land: ≤45s y pista libre
+  if (dt != null && dt <= 45000 && !runwayState.inUse) {
+    if (mem.phase !== 'CLRD') {
+      const rwIdent = activeRunwayGeom()?.rw?.ident || '';
+      emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: rwIdent, text: 'Autorizado a aterrizar' });
+      lastInstr.set(op.name, { phase: 'CLRD', ts: now });
     }
+    return;
   }
 }
+
 
 // ========= Publicación de estado =========
 function publishRunwayState() {
@@ -512,19 +547,39 @@ function publishRunwayState() {
 
   // Secuencia “avanzada” + beacons para guiar
   const g = activeRunwayGeom();
-  io.emit('sequence-update', {
-    serverTime: now,
-    airfield,
-    beacons: g ? { B1: g.B1, B2: g.B2 } : null,
-    slots: slots.map(s => ({
+io.emit('sequence-update', {
+  serverTime: now,
+  airfield,
+  beacons: g ? { B1: g.B1, B2: g.B2 } : null,
+  slots: slots.map((s, idx) => {
+    const op = lastOpsById.get(s.opId) || {};
+    const prev = idx > 0 ? slots[idx-1] : null;
+    const prevOp = prev ? lastOpsById.get(prev.opId) : null;
+
+    // rot y wake efectivo con el anterior (si hay)
+    const rotSec = ROT_BY_CAT[op.category] ?? 100;
+    const wakePrevNextSec = (prevOp ? (wakeExtraSeconds(prevOp.category, op.category) || 0) : 0);
+
+    return {
       opId: s.opId,
       type: s.type,
       name: (s.opId || '').split('#')[1],
       startMs: s.startMs,
       endMs: s.endMs,
       frozen: s.frozen,
-    })),
-  });
+
+      // 👇 enriquecido para la UI
+      category: op.category || null,
+      priority: op.priority ?? null,
+      etaB1: op.etaB1 ?? null,
+      etaB2: op.etaB2 ?? null,
+      rotSec,
+      wakePrevNextSec,
+      shiftAccumMs: shiftAccumMsByOpId.get(s.opId) || 0,
+    };
+  }),
+});
+
 }
 
 
@@ -579,63 +634,7 @@ if (arrOrder.length) {
     for (const s of slots) {
       if (s.type === 'ARR') maybeSendInstruction(s.opId, opsById);
     }
-    // --- ATC: instrucciones dirigidas por avión, basadas en orden actual y beacons ---
-    try {
-      const beacons = getActiveBeacons();
-      if (beacons) {
-        const B1 = beacons.B1, B2 = beacons.B2;
 
-        // 1) Todos los que pidieron aterrizaje
-        for (const l of runwayState.landings) {
-          if (!l?.name) continue;
-
-          // ¿Soy #1?
-          const isFirst = (runwayState.landings[0] && runwayState.landings[0].name === l.name);
-
-          if (!isFirst) {
-            // No soy #1 -> vector a B2
-            maybeEmitInstruction(l.name, {
-              type: 'goto-beacon',
-              beacon: 'B2',
-              lat: B2.lat,
-              lon: B2.lon,
-              text: 'Proceda a B2',
-            });
-            continue;
-          }
-
-          // Soy #1 -> ir a B1 si aún estoy lejos
-          const dB1 = distUserToLatLonM(l.name, B1.lat, B1.lon);
-          if (dB1 > 800) {
-            maybeEmitInstruction(l.name, {
-              type: 'turn-to-B1',
-              text: 'Vire hacia B1',
-            });
-          } else {
-              // Cerca de B1 → si el slot más próximo es mío y pista libre → cleared to land
-              const mySlot = (runwayState.timelineSlots || []).find(
-                s => s.type === 'ARR' && s.opId === `ARR#${l.name}`
-              );
-              const slotMs = mySlot?.startMs || null;
-              const soon = slotMs ? (slotMs - Date.now()) <= 60000 : false; // <= 60s
-              const runwayFree = !runwayState.inUse;
-
-
-            if (runwayFree && soon) {
-              maybeEmitInstruction(l.name, {
-                type: 'cleared-to-land',
-                rwy: lastAirfield?.runways?.[0]?.active_end === 'B'
-                  ? (lastAirfield?.runways?.[0]?.identB || '')
-                  : (lastAirfield?.runways?.[0]?.identA || ''),
-                text: 'Autorizado a aterrizar',
-              });
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.warn('ATC instruction emit error:', e);
-    }
 
 
 }
@@ -1025,6 +1024,47 @@ socket.on('warning', (warningData) => {
       console.error('runway-get error:', e);
     }
   });
+
+  // Reporte de arremetida (go-around): libera slot / quita freeze y reingresa
+socket.on('go-around', (msg = {}) => {
+  try {
+    const name = String(msg.name || socketIdToName[socket.id] || '');
+    if (!name) return;
+
+    // Quitar freeze y “reinsertar” como llegada activa
+    const L = runwayState.landings.find(l => l.name === name);
+    if (L) {
+      L.frozenLevel = 0;           // pierde el freeze
+      L.emergency = !!L.emergency; // opcional, mantené flags
+      // (ETA se recalculará en planificar() con computeETAsAndFreeze)
+    } else {
+      // Si no estaba en cola, reingresarlo como ARR
+      runwayState.landings.push({
+        name,
+        callsign: userLocations[name]?.callsign || '',
+        aircraft: userLocations[name]?.type || '',
+        type: userLocations[name]?.type || '',
+        emergency: false,
+        altitude: userLocations[name]?.alt || 999999,
+        requestedAt: new Date(),
+      });
+    }
+
+    // Si estaba ocupando pista, liberarla
+    if (runwayState.inUse && runwayState.inUse.name === name) {
+      runwayState.inUse = null;
+    }
+
+    // Aviso al piloto (UI/voz)
+    emitToUser(name, 'runway-msg', { text: 'Arremetida registrada. Reingresando en secuencia.', key: 'go-around' });
+
+    planRunwaySequence();
+    publishRunwayState();
+  } catch (e) {
+    console.error('go-around error:', e);
+  }
+});
+
 
   /* =================== FIN LISTENERS NUEVOS: RUNWAY  ==================== */
 

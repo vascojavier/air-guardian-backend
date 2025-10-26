@@ -23,6 +23,8 @@ import * as Speech from 'expo-speech';
 
 
 
+
+
 interface LatLon {
   latitude: number;
   longitude: number;
@@ -118,6 +120,9 @@ const Radar = () => {
   // debounce solo para TA
   const taDebounceRef = useRef<NodeJS.Timeout | null>(null);
   const TA_DEBOUNCE_MS = 400;
+  const snoozeUntilRef = useRef<number>(0);
+  const snoozeIdRef = useRef<string | null>(null);
+
 
 
   const [warnings, setWarnings] = useState<{ [id: string]: Warning }>({});
@@ -152,6 +157,11 @@ const Radar = () => {
   });
 
   const lastSentWarningRef = useRef<{ sig: string; t: number } | null>(null);
+  const lastRAIdRef = useRef<string | null>(null);
+  // Hold por RA de 6s por avión (evita que TA local “pise” al RA backend)
+  const raHoldUntilRef = useRef<Record<string, number>>({});
+
+
   
 
   const maybeEmitWarning = (w: Warning) => {
@@ -770,10 +780,26 @@ useEffect(() => {
       Date.now() < selectedHoldUntilRef.current ? prev : null
       );
     }
-
     setLocalWarning(nuevoWarningLocal);
 
+    // ⬇️ recordar el último RA local
+    if (
+      nuevoWarningLocal &&
+      (nuevoWarningLocal.alertLevel === 'RA_LOW' || nuevoWarningLocal.alertLevel === 'RA_HIGH')
+    ) {
+      lastRAIdRef.current = nuevoWarningLocal.id;
+    }
+
+    // ⬇️ salir si está corriendo el hold de RA o el bloqueador temporal
     if (holdTimerRef.current || Date.now() < blockUpdateUntil.current) return;
+
+    // ⬇️ evita re-mostrar el mismo avión mientras dura el snooze
+    const candId = (nuevoWarningLocal?.id) || (backendWarning?.id);
+    if (snoozeIdRef.current && Date.now() < snoozeUntilRef.current && candId === snoozeIdRef.current) {
+      return;
+    }
+
+
 
 
     const prioridades = { RA_HIGH: 3, RA_LOW: 2, TA: 1 };
@@ -815,24 +841,33 @@ useEffect(() => {
     const backendPriority = prioridades[backendWarning!.alertLevel];
 
     if (localPriority > backendPriority) {
+      // Gana el LOCAL → sí emitimos (respetando hold/TA)
       if (nuevoWarningLocal!.alertLevel === 'TA' || !holdTimerRef.current) {
         setPrioritizedWarning(nuevoWarningLocal!);
-        maybeEmitWarning(nuevoWarningLocal!);   // ⬅️ AÑADIDO
+        maybeEmitWarning(nuevoWarningLocal!);
       }
     } else if (backendPriority > localPriority) {
+      // Gana el BACKEND → NO re-emitir
       if (backendWarning!.alertLevel === 'TA' || !holdTimerRef.current) {
         setPrioritizedWarning(backendWarning!);
-        maybeEmitWarning(backendWarning!);      // ⬅️ AÑADIDO
+        // (no maybeEmitWarning aquí)
       }
     } else {
-      const localTime = nuevoWarningLocal!.timeToImpact || Infinity;
+      // Empate: decidir por menor TTI y solo emitir si el ganador es local
+      const localTime   = nuevoWarningLocal!.timeToImpact || Infinity;
       const backendTime = backendWarning!.timeToImpact || Infinity;
       const ganador = localTime < backendTime ? nuevoWarningLocal! : backendWarning!;
+
       if (ganador.alertLevel === 'TA' || !holdTimerRef.current) {
-        setPrioritizedWarning(ganador);
-        maybeEmitWarning(ganador);              // ya lo tenías acá ✅
+        if (ganador === backendWarning) {
+          setPrioritizedWarning(ganador);           // NO re-emitir
+        } else {
+          setPrioritizedWarning(ganador);           // Sí emitir si ganó el local
+          maybeEmitWarning(ganador);
+        }
       }
     }
+
 
 
 
@@ -944,6 +979,13 @@ s.on('conflicto', (data: any) => {
     ? data.alertLevel
     : (data.type === 'RA' ? 'RA_LOW' : 'TA');
 
+    // ID unificado del “otro” avión y hold por RA (6s)
+    const id = String(match?.id ?? data.id ?? data.name);
+    if (level === 'RA_LOW' || level === 'RA_HIGH') {
+      raHoldUntilRef.current[id] = Date.now() + 6000;
+    }
+
+
   const enrichedWarning: Warning = {
     id: match?.id ?? data.id ?? data.name,
     name: match?.name ?? data.name,
@@ -952,7 +994,8 @@ s.on('conflicto', (data: any) => {
     alt: match?.alt ?? data.alt,
     heading: match?.heading ?? data.heading,
     speed: match?.speed ?? data.speed,
-    alertLevel: level,
+    alertLevel: data.alertLevel
+    ?? (data.type === 'RA' ? 'RA_LOW' : 'TA'),
     timeToImpact: typeof data.timeToImpact === 'number' ? data.timeToImpact : 999,
     distanceMeters: distNow,
     aircraftIcon: match?.aircraftIcon ?? data.aircraftIcon ?? '2.png',
@@ -960,9 +1003,35 @@ s.on('conflicto', (data: any) => {
     type: match?.type ?? data.type,
   };
 
-  setWarnings(prev => ({ ...prev, [enrichedWarning.id]: enrichedWarning }));
-  setBackendWarning(enrichedWarning);
-});
+    setWarnings(prev => ({ ...prev, [enrichedWarning.id]: enrichedWarning }));
+    setBackendWarning(enrichedWarning);
+      // ⏳ TTL: si no se renueva el 'conflicto' en 4s, se limpia
+  const BW_TTL_MS = 4000;
+  if ((s as any).__bwTtlTimer) clearTimeout((s as any).__bwTtlTimer);
+  (s as any).__bwTtlTimer = setTimeout(() => {
+    // ⚠️ si todavía hay hold activo para este id, no limpies
+    const holdUntil = raHoldUntilRef.current[id] ?? 0;
+    if (Date.now() < holdUntil) return;
+
+    setBackendWarning(prev => (prev && prev.id === id) ? null : prev);
+    setPrioritizedWarning(prev => (prev && prev.id === id) ? null : prev);
+  }, BW_TTL_MS);
+
+  });
+
+  // ⬇️ PEGAR ESTO JUSTO AQUÍ
+  s.on('conflicto-clear', (msg: any) => {
+    const id = String(msg?.id || '');
+    if (!id) return;
+    clearWarningFor(id);
+    setBackendWarning(prev => (prev && prev.id === id) ? null : prev);
+    setPrioritizedWarning(prev => (prev && prev.id === id) ? null : prev);
+  });
+
+  // (sigue el resto)
+  s.on('traffic-update', (data: any) => {
+    // ...
+  });
 
 
     s.on('traffic-update', (data: any) => {
@@ -1203,6 +1272,8 @@ s.on('conflicto', (data: any) => {
       s.off('runway-msg');
       s.off('sequence-update');
       s.off('atc-instruction');
+      s.off('conflicto-clear');
+
 
 
 
@@ -1399,12 +1470,33 @@ if (
     if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
     blockUpdateUntil.current = Date.now() + 6000;
 
+    const pwId = prioritizedWarning.id; // capturo el id mostrado
+
     holdTimerRef.current = setTimeout(() => {
       setSelectedWarning(null);
       setPrioritizedWarning(null);
+
+      // ⬇️ además oculto conflict/selected si son el mismo avión
+      setConflict(prev => (prev && prev.id === pwId ? null : prev));
+      setSelected(prev => (prev && prev.id === pwId ? null : prev));
+
+      // ⬇️ snooze 3s para no re-mostrar inmediatamente al siguiente tick
+      snoozeIdRef.current = pwId;
+      snoozeUntilRef.current = Date.now() + 3000;
+
+      // reset internos
       holdTimerRef.current = null;
-      lastSentWarningRef.current = null; // <-- reset
+      lastSentWarningRef.current = null;
+
+      // 🔕 avisar al resto que este RA terminó
+      try {
+        const id = lastRAIdRef.current || pwId; // usa el que tengas más confiable
+        lastRAIdRef.current = null;
+        if (id) socketRef.current?.emit('warning-clear', { id });
+      } catch {}
     }, 6000);
+
+
   }
   // TA no setea hold (puede ser preempted por RA)
   }, [prioritizedWarning?.id, prioritizedWarning?.alertLevel]);
@@ -1854,6 +1946,13 @@ if (firstLanding?.name === me && !st.inUse && defaultActionForMe() === 'land') {
           + `${runwayState.state.inUse.name} (${runwayState.state.inUse.callsign||'—'})`
         : 'Pista libre'}
     </Text>
+
+{(() => { const me=myPlane?.id||username; const s=slots.find(x=>x.name===me); return s?.frozen ? <Text style={{marginBottom:4}}>🔒 Posición congelada (B1)</Text> : null; })()}
+
+{(() => { const me=myPlane?.id||username; const s=slots.find(x=>x.name===me); return s ? <Text style={{marginBottom:2}}>ETA a slot: {Math.max(0, Math.round((s.startMs - Date.now())/1000))} s</Text> : null; })()}
+
+{(() => { const me=myPlane?.id||username; const s=slots.find(x=>x.name===me) as any; const sh=Math.round((s?.shiftAccumMs||0)/1000); return s&&sh>0 ? <Text style={{marginBottom:8}}>Desvío aplicado: +{sh}s</Text> : null; })()}
+
 
     {/* Acciones según estado (volando/tierra) */}
     <View style={{flexDirection:'row', gap:10, flexWrap:'wrap', marginBottom:6}}>
