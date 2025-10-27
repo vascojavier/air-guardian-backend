@@ -159,6 +159,10 @@ export default function PistaScreen() {
               const { B1, B2 } = makeDefaultBeacons(A, B, active);
               setBeaconB1(B1); setBeaconB2(B2);
             }
+            // dentro de cargar(), justo después de calcular y setear A/B/activa/rumbo/beacons:
+            try {
+              socket.emit('airfield-upsert', { airfield: af });   // 👈 re-publicar
+            } catch {}
 
             return;
           }
@@ -181,7 +185,8 @@ export default function PistaScreen() {
     };
     cargar();
     return () => {
-      try { socket?.disconnect(); } catch {}
+      // ❌ no desconectes el socket global acá
+      // try { socket?.disconnect(); } catch {}
     };
   }, [socket]);
 
