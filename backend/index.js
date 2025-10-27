@@ -2,6 +2,11 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
+// === FSM / sticky & compliance ===
+const FINAL_LOCK_RADIUS_M = 2000;   // dentro de 2 km de B1 no reordenar más (comprometido)
+const MAX_B2_TO_B1_S = 180;         // si en >180 s no progresa de B2→B1, pierde orden (vuelve a WAIT)
+const FINAL_DRIFT_MAX_M = 2500;     // si en FINAL se “abre” >2.5 km de B1, pierde FINAL
+
 
 const app = express();
 const server = http.createServer(app);
@@ -180,12 +185,13 @@ function wakeExtraSeconds(prevCat, nextCat) {
 
 // ========= Estado de scheduler =========
 const runwayState = {
-  landings: [],   // { name, callsign, type, priority, etaB2, etaB1, frozenLevel }
+  landings: [],   // { name, callsign, type, priority, etaB2, etaB1, frozenLevel, phase, phaseTs, lastAdvancementTs, committed }
   takeoffs: [],   // { name, callsign, type, ready, etReady }
   inUse: null,    // { action:'landing'|'takeoff', name, callsign, startedAt, slotMin }
   timelineSlots: [], // [{opId, type:'ARR'|'DEP', startMs, endMs, frozen}]
   lastOrder: { landings: [], takeoffs: [] },
 };
+
 
 // Guarda el corrimiento total aplicado a cada slot (opId) en ms
 const shiftAccumMsByOpId = new Map();
@@ -241,6 +247,106 @@ function assignBeaconsFor(name) {
   }
   return asg;
 }
+
+function getLandingByName(name) {
+  return runwayState.landings.find(l => l.name === name);
+}
+
+function setPhase(name, phase) {
+  const L = getLandingByName(name);
+  if (!L) return;
+  if (L.phase !== phase) {
+    L.phase = phase;
+    L.phaseTs = Date.now();
+  }
+}
+
+function markAdvancement(name) {
+  const L = getLandingByName(name);
+  if (L) L.lastAdvancementTs = Date.now();
+}
+
+// Determina si ya no debe reordenarse (comprometido a final)
+function isCommitted(name) {
+  const L = getLandingByName(name);
+  if (!L) return false;
+  if (L.frozenLevel === 1) return true;
+  if (L.phase === 'B1' || L.phase === 'FINAL') return true;
+
+  // margen de 2 km a B1: no reordenar aunque otro tenga ETA menor
+  const asg = assignBeaconsFor(name);
+  const u = userLocations[name];
+  if (!asg || !u) return false;
+  const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
+  return isFinite(dB1) && dB1 <= FINAL_LOCK_RADIUS_M;
+}
+
+function updateApproachPhase(name) {
+  const L = getLandingByName(name);
+  if (!L) return;
+  const asg = assignBeaconsFor(name);
+  const u = userLocations[name];
+  if (!asg || !u) return;
+
+  const dB2 = getDistance(u.latitude, u.longitude, asg.b2.lat, asg.b2.lon);
+  const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
+
+  // Llegó a B2
+  if (isFinite(dB2) && dB2 <= BEACON_REACHED_M) {
+    if (L.phase === 'WAIT') {
+      setPhase(name, 'B2');
+      markAdvancement(name);
+    }
+  }
+
+  // Llegó a B1
+  if (isFinite(dB1) && dB1 <= BEACON_REACHED_M) {
+    if (L.phase !== 'FINAL') {
+      setPhase(name, 'FINAL');     // entra en final
+      markAdvancement(name);
+      L.frozenLevel = 1;           // opcional: freeze al tocar B1
+    }
+  }
+
+  // Commit dinámico
+  L.committed = isCommitted(name);
+}
+
+
+function enforceCompliance() {
+  const now = Date.now();
+  for (const L of runwayState.landings) {
+    const asg = assignBeaconsFor(L.name);
+    const u = userLocations[L.name];
+    if (!asg || !u) continue;
+
+    const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
+    const dB2 = getDistance(u.latitude, u.longitude, asg.b2.lat, asg.b2.lon);
+
+    // Si estaba en FINAL pero se aleja demasiado de B1, pierde FINAL
+    if (L.phase === 'FINAL' && isFinite(dB1) && dB1 > FINAL_DRIFT_MAX_M) {
+      L.phase = 'WAIT';
+      L.frozenLevel = 0;
+      L.phaseTs = now;
+      L.committed = false;
+    }
+
+    // Si estaba en B2 y no progresa a B1 en el tiempo máximo, pierde el orden
+    if (L.phase === 'B2') {
+      const since = now - (L.lastAdvancementTs || L.phaseTs || now);
+      if (since > MAX_B2_TO_B1_S * 1000) {
+        L.phase = 'WAIT';
+        L.frozenLevel = 0;
+        L.phaseTs = now;
+        L.committed = false;
+      }
+    }
+
+    // Refrescar committed siempre
+    L.committed = isCommitted(L.name);
+  }
+}
+
 
 // Velocidad sobre tierra en m/s tomada del último update del usuario.
 // Usa mínimo 30 km/h para evitar 0 al calcular ETA.
@@ -299,24 +405,34 @@ function computeETAsAndFreeze(l) {
 // ========= Construcción de operaciones y planificador =========
 function buildOperations(nowMs) {
   const ops = [];
+
   // Llegadas
   for (const l of runwayState.landings) {
     computeETAsAndFreeze(l);
-    const priority =
+
+    // ▲ calcular "committed" (dentro de 2 km de B1, o tocó B1/FINAL, o frozen)
+    l.committed = isCommitted(l.name);
+
+    const priorityBase =
       (l.emergency ? 0 : 1000) +
       Math.min(999, (l.etaB1 ?? l.etaB2 ?? 999999));
-    l.priority = priority;
+
+    l.priority = priorityBase;
+
     ops.push({
       id: `ARR#${l.name}`,
       type: 'ARR',
       name: l.name,
       callsign: l.callsign || '',
       category: parseCategory(l.type),
-      priority,
+      priority: priorityBase,
       etaB1: l.etaB1, etaB2: l.etaB2,
       frozen: l.frozenLevel === 1,
+      committed: !!l.committed,
+      emergency: !!l.emergency,
     });
   }
+
   // Salidas
   const now = nowMs ?? Date.now();
   for (const t of runwayState.takeoffs) {
@@ -334,16 +450,46 @@ function buildOperations(nowMs) {
       frozen: false,
     });
   }
-  // Orden preliminar por prioridad y ETA objetivo
-  ops.sort((a, b) => {
-    const pa = a.priority - b.priority;
-    if (pa !== 0) return pa;
-    const ta = a.type === 'ARR' ? (a.etaB1 ?? a.etaB2 ?? 9e12) : (a.etReady ?? 9e12);
-    const tb = b.type === 'ARR' ? (b.etaB1 ?? b.etaB2 ?? 9e12) : (b.etReady ?? 9e12);
-    return ta - tb;
-  });
+
+  // Orden con emergency/committed primero y, si ambos committed, respetar orden previo
+// Orden preliminar por prioridad/ETA, ajustado por committed y orden previo
+const prevOrder = runwayState.lastOrder.landings || [];
+const idxInPrev = (name) => {
+  const i = prevOrder.indexOf(name);
+  return i === -1 ? 1e9 : i;
+};
+
+ops.sort((a, b) => {
+  // 1) Emergencia primero
+  const aEmer = (a.type === 'ARR') && runwayState.landings.find(x=>x.name===a.name)?.emergency;
+  const bEmer = (b.type === 'ARR') && runwayState.landings.find(x=>x.name===b.name)?.emergency;
+  if (aEmer && !bEmer) return -1;
+  if (!aEmer && bEmer) return 1;
+
+  // 2) Llegadas comprometidas antes que no comprometidas
+  if (a.type === 'ARR' && b.type === 'ARR') {
+    if (a.committed && !b.committed) return -1;
+    if (!a.committed && b.committed) return 1;
+
+    // 3) Si ambos committed, mantener orden previo (evita shuffle por ETA)
+    if (a.committed && b.committed) {
+      return idxInPrev(a.name) - idxInPrev(b.name);
+    }
+  }
+
+  // 4) Resto por priority/ETA (como ya hacías)
+  const pa = a.priority - b.priority;
+  if (pa !== 0) return pa;
+
+  const ta = a.type === 'ARR' ? (a.etaB1 ?? a.etaB2 ?? 9e12) : (a.etReady ?? 9e12);
+  const tb = b.type === 'ARR' ? (b.etaB1 ?? b.etaB2 ?? 9e12) : (b.etReady ?? 9e12);
+  return ta - tb;
+});
+
+
   return ops;
 }
+
 
 function tryShiftChain(slots, startIdx, shiftMs, opsById) {
   // intenta correr slots [startIdx..] hacia adelante respetando MAX_DELAY_SHIFT y frozen
@@ -469,11 +615,10 @@ function maybeSendInstruction(opId, opsById) {
   const op = opsById.get(opId);
   if (!op || op.type !== 'ARR') return;
 
+  const L = getLandingByName(op.name);
   const asg = assignBeaconsFor(op.name);
-  if (!asg) return;
-
   const u = userLocations[op.name];
-  if (!u) return;
+  if (!L || !asg || !u) return;
 
   const mySlot = runwayState.timelineSlots.find(s => s.opId === opId);
   const now = Date.now();
@@ -483,39 +628,60 @@ function maybeSendInstruction(opId, opsById) {
   const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
   const mem = lastInstr.get(op.name) || { phase: null, ts: 0 };
 
-  // 1) Pre-secuencia: si está fuera de B2 -> ir a B2
-  if (dB2 > BEACON_REACHED_M) {
-    if (mem.phase !== 'B2') {
-      emitToUser(op.name, 'atc-instruction', {
-        type: 'goto-beacon',
-        beacon: 'B2',
-        lat: asg.b2.lat, lon: asg.b2.lon,
-        text: 'Proceda a B2'
-      });
-      lastInstr.set(op.name, { phase: 'B2', ts: now });
-    }
-    return;
-  }
-
-  // 2) Ventana de giro a B1: ~90s antes del slot (si aún no llegó a B1)
-  if (dt != null && dt <= 90000 && dB1 > BEACON_REACHED_M) {
-    if (mem.phase !== 'B1') {
-      emitToUser(op.name, 'atc-instruction', { type: 'turn-to-B1', text: 'Vire hacia B1' });
-      lastInstr.set(op.name, { phase: 'B1', ts: now });
-    }
-    return;
-  }
-
-  // 3) Cleared-to-land: ≤45s y pista libre
-  if (dt != null && dt <= 45000 && !runwayState.inUse) {
-    if (mem.phase !== 'CLRD') {
+  // === Reglas sin histéresis ===
+  // Si ya está en FINAL, nunca volver a pedir B1.
+  if (L.phase === 'FINAL') {
+    // 3) Cleared-to-land: ≤45s y pista libre
+    if (dt != null && dt <= 45000 && !runwayState.inUse && mem.phase !== 'CLRD') {
       const rwIdent = activeRunwayGeom()?.rw?.ident || '';
       emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: rwIdent, text: 'Autorizado a aterrizar' });
       lastInstr.set(op.name, { phase: 'CLRD', ts: now });
     }
     return;
   }
+
+  // 1) Pre-secuencia: si está fuera de B2 -> ir a B2 (sólo si aún no tocó B2)
+  if (L.phase === 'WAIT' || L.phase === 'B2') {
+    if (isFinite(dB2) && dB2 > BEACON_REACHED_M) {
+      if (mem.phase !== 'B2') {
+        emitToUser(op.name, 'atc-instruction', {
+          type: 'goto-beacon',
+          beacon: 'B2',
+          lat: asg.b2.lat, lon: asg.b2.lon,
+          text: 'Proceda a B2'
+        });
+        lastInstr.set(op.name, { phase: 'B2', ts: now });
+      }
+      return;
+    }
+  }
+
+  // 2) Ventana de giro a B1 (~90 s) si aún no llegó a B1 y no está en FINAL
+  if ((L.phase === 'WAIT' || L.phase === 'B2' || L.phase === 'B1') && dt != null && dt <= 90000) {
+    if (isFinite(dB1) && dB1 > BEACON_REACHED_M) {
+      if (mem.phase !== 'B1') {
+        emitToUser(op.name, 'atc-instruction', { type: 'turn-to-B1', text: 'Vire hacia B1' });
+        lastInstr.set(op.name, { phase: 'B1', ts: now });
+        // sube de fase si venía en WAIT: está “en misión a B1”
+        if (L.phase === 'WAIT') setPhase(op.name, 'B1');
+      }
+      return;
+    }
+  }
+
+  // 3) Cleared-to-land (sólo si no está FINAL pero ya muy cerca del slot y B1 alcanzado)
+  if (dt != null && dt <= 45000 && !runwayState.inUse) {
+    if (isFinite(dB1) && dB1 <= BEACON_REACHED_M) {
+      if (mem.phase !== 'CLRD') {
+        const rwIdent = activeRunwayGeom()?.rw?.ident || '';
+        emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: rwIdent, text: 'Autorizado a aterrizar' });
+        lastInstr.set(op.name, { phase: 'CLRD', ts: now });
+      }
+      return;
+    }
+  }
 }
+
 
 
 // ========= Publicación de estado =========
@@ -592,23 +758,23 @@ function cleanupInUseIfDone() {
   if (Date.now() > end) runwayState.inUse = null;
 }
 
-function planRunwaySequence() {
-  cleanupInUseIfDone();
+  function planRunwaySequence() {
+    cleanupInUseIfDone();
 
-  // Planificar
-  const { slots, opsById } = planificar(Date.now());
+    // Planificar
+    const { slots, opsById } = planificar(Date.now());
 
-  const arrOrder = slots
-  .filter(s => s.type === 'ARR')
-  .map(s => (s.opId || '').split('#')[1]);
+    const arrOrder = slots
+    .filter(s => s.type === 'ARR')
+    .map(s => (s.opId || '').split('#')[1]);
 
-if (arrOrder.length) {
-  runwayState.landings.sort((a, b) => {
-    const ia = arrOrder.indexOf(a.name);
-    const ib = arrOrder.indexOf(b.name);
-    return (ia === -1 ? 1e9 : ia) - (ib === -1 ? 1e9 : ib);
-  });
-}
+  if (arrOrder.length) {
+    runwayState.landings.sort((a, b) => {
+      const ia = arrOrder.indexOf(a.name);
+      const ib = arrOrder.indexOf(b.name);
+      return (ia === -1 ? 1e9 : ia) - (ib === -1 ? 1e9 : ib);
+    });
+  }
 
 
   // Mensajes de turno (compatibilidad)
@@ -643,6 +809,7 @@ if (arrOrder.length) {
 setInterval(() => {
   try {
     if (runwayState.landings.length || runwayState.takeoffs.length) {
+      enforceCompliance();
       planRunwaySequence();
       publishRunwayState();
     }
@@ -700,39 +867,43 @@ io.on('connection', (socket) => {
       timestamp: Date.now(),
       socketId: socket.id
     };
+    // ► FSM: actualizar fase con distancias reales
+    updateApproachPhase(name);
+
 
     socketIdToName[socket.id] = name;
 
     console.log('🗺️ Estado actual de userLocations:', userLocations);
 
-for (const [recvName, info] of Object.entries(userLocations)) {
-  if (!info?.socketId) continue;
+  for (const [recvName, info] of Object.entries(userLocations)) {
+    if (!info?.socketId) continue;
 
-  const list = Object.values(userLocations)
-    .filter(u => u.name !== recvName) // cada uno recibe “todos menos yo”
-    .map(u => ({
-      name: u.name,
-      lat: u.latitude,
-      lon: u.longitude,
-      alt: u.alt,
-      heading: u.heading,
-      type: u.type,
-      speed: u.speed,
-      callsign: u.callsign,
-      aircraftIcon: u.icon
-    }));
-  
-  io.to(info.socketId).emit('traffic-update', list);
-}
+    const list = Object.values(userLocations)
+      .filter(u => u.name !== recvName) // cada uno recibe “todos menos yo”
+      .map(u => ({
+        name: u.name,
+        lat: u.latitude,
+        lon: u.longitude,
+        alt: u.alt,
+        heading: u.heading,
+        type: u.type,
+        speed: u.speed,
+        callsign: u.callsign,
+        aircraftIcon: u.icon
+      }));
+    
+      io.to(info.socketId).emit('traffic-update', list);
+    }
 
     
 
     // ►► (AGREGADO) replanificar si hay solicitudes pendientes y cambió la kinemática
     if (runwayState.landings.length || runwayState.takeoffs.length) {
+      enforceCompliance();
       planRunwaySequence();
       publishRunwayState();
     }
-  });
+ });
 
   socket.on('get-traffic', () => {
     // (3) Normalizar a lat/lon en initial-traffic
@@ -945,7 +1116,12 @@ socket.on('warning', (warningData) => {
             name, callsign, aircraft, type,
             emergency: !!emergency,
             altitude: typeof altitude === 'number' ? altitude : 999999,
-            requestedAt: new Date()
+            requestedAt: new Date(),
+            phase: 'WAIT',
+            phaseTs: Date.now(),
+            lastAdvancementTs: Date.now(),
+            frozenLevel: 0,
+            committed: false,
           });
         }
       } else if (action === 'takeoff') {
