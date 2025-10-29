@@ -52,6 +52,24 @@ function getDistance(lat1, lon1, lat2, lon2) {
   const INSTR_COOLDOWN_MS = 5000;
   const lastInstrByName = {}; // { [name]: { type: 'goto-beacon'|'turn-to-B1'|'cleared-to-land', ts: number } }
 
+
+    // ==== Anti-histéresis por avión (FSM de aproximación) ====
+  const PHASE_ORDER = ['TO_B2','TO_B1','FINAL','CLRD']; // orden estricto, no se retrocede
+  const approachPhaseByName = new Map(); // name -> { phase: 'TO_B2'|'TO_B1'|'FINAL'|'CLRD', ts:number }
+
+  function getPhaseIdx(p){ return Math.max(0, PHASE_ORDER.indexOf(p)); }
+  function getApproachPhase(name){
+    return approachPhaseByName.get(name)?.phase || 'TO_B2';
+  }
+  function setApproachPhase(name, nextPhase){
+    const cur = getApproachPhase(name);
+    if (getPhaseIdx(nextPhase) > getPhaseIdx(cur)) {
+      approachPhaseByName.set(name, { phase: nextPhase, ts: Date.now() });
+      // console.log(`[PHASE] ${name}: ${cur} -> ${nextPhase}`);
+    }
+  }
+
+
   // Beacons activos desde el airfield
   function getActiveBeacons() {
     const rw = lastAirfield?.runways?.[0];
@@ -606,20 +624,23 @@ function planificar(nowMs) {
   return { slots, opsById };
 }
 
-// ========= Mensajería ATC =========
-function emitToUser(name, event, payload) {
-  const sid = userLocations[name]?.socketId;
-  if (sid) io.to(sid).emit(event, payload);
-}
+  // ========= Mensajería ATC =========
+  function emitToUser(name, event, payload) {
+    const sid = userLocations[name]?.socketId;
+    if (sid) io.to(sid).emit(event, payload);
+  }
+
 function maybeSendInstruction(opId, opsById) {
   const op = opsById.get(opId);
   if (!op || op.type !== 'ARR') return;
 
-  const L = getLandingByName(op.name);
   const asg = assignBeaconsFor(op.name);
-  const u = userLocations[op.name];
-  if (!L || !asg || !u) return;
+  if (!asg) return;
 
+  const u = userLocations[op.name];
+  if (!u) return;
+
+  const phase = getApproachPhase(op.name); // 'TO_B2'|'TO_B1'|'FINAL'|'CLRD'
   const mySlot = runwayState.timelineSlots.find(s => s.opId === opId);
   const now = Date.now();
   const dt = mySlot ? (mySlot.startMs - now) : null;
@@ -628,59 +649,66 @@ function maybeSendInstruction(opId, opsById) {
   const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
   const mem = lastInstr.get(op.name) || { phase: null, ts: 0 };
 
-  // === Reglas sin histéresis ===
-  // Si ya está en FINAL, nunca volver a pedir B1.
-  if (L.phase === 'FINAL') {
-    // 3) Cleared-to-land: ≤45s y pista libre
-    if (dt != null && dt <= 45000 && !runwayState.inUse && mem.phase !== 'CLRD') {
-      const rwIdent = activeRunwayGeom()?.rw?.ident || '';
-      emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: rwIdent, text: 'Autorizado a aterrizar' });
-      lastInstr.set(op.name, { phase: 'CLRD', ts: now });
+  // >>> Auto-advance de fase según proximidad a beacons <<<
+  try {
+    if (isFinite(dB2) && dB2 <= BEACON_REACHED_M && getApproachPhase(op.name) === 'TO_B2') {
+      setApproachPhase(op.name, 'TO_B1');
+    }
+    if (isFinite(dB1) && dB1 <= BEACON_REACHED_M && getApproachPhase(op.name) !== 'CLRD') {
+      // Cruzó B1: ya está en final (aunque no haya occupy)
+      setApproachPhase(op.name, 'FINAL');
+    }
+  } catch {}
+
+  const cur = getApproachPhase(op.name);
+
+  // 0) Si ya está CLRD, no emitir nada que retroceda
+  if (cur === 'CLRD') return;
+
+  // 1) Si aún está en TO_B2 y está fuera de B2 → ordenar ir a B2
+  if (cur === 'TO_B2' && dB2 > BEACON_REACHED_M) {
+    if (mem.phase !== 'B2') {
+      emitToUser(op.name, 'atc-instruction', {
+        type: 'goto-beacon',
+        beacon: 'B2',
+        lat: asg.b2.lat, lon: asg.b2.lon,
+        text: 'Proceda a B2'
+      });
+      lastInstr.set(op.name, { phase: 'B2', ts: now });
+      // no cambiamos fase acá (sigue TO_B2) hasta “cruzar” B2
     }
     return;
   }
 
-  // 1) Pre-secuencia: si está fuera de B2 -> ir a B2 (sólo si aún no tocó B2)
-  if (L.phase === 'WAIT' || L.phase === 'B2') {
-    if (isFinite(dB2) && dB2 > BEACON_REACHED_M) {
-      if (mem.phase !== 'B2') {
-        emitToUser(op.name, 'atc-instruction', {
-          type: 'goto-beacon',
-          beacon: 'B2',
-          lat: asg.b2.lat, lon: asg.b2.lon,
-          text: 'Proceda a B2'
-        });
-        lastInstr.set(op.name, { phase: 'B2', ts: now });
-      }
-      return;
+  // 2) Si está en TO_B1 (o auto-promovido desde B2) y falta para el slot → ventana de giro a B1
+  //    NUNCA ordenamos B1 si ya estás en FINAL (evita la histéresis).
+  if ((cur === 'TO_B2' || cur === 'TO_B1') && dt != null && dt <= 90000 && dB1 > BEACON_REACHED_M) {
+    // Si todavía no promovimos a TO_B1, promové ya (lógica suave)
+    if (cur === 'TO_B2') setApproachPhase(op.name, 'TO_B1');
+
+    if (getApproachPhase(op.name) === 'TO_B1' && mem.phase !== 'B1') {
+      emitToUser(op.name, 'atc-instruction', { type: 'turn-to-B1', text: 'Vire hacia B1' });
+      lastInstr.set(op.name, { phase: 'B1', ts: now });
     }
+    return;
   }
 
-  // 2) Ventana de giro a B1 (~90 s) si aún no llegó a B1 y no está en FINAL
-  if ((L.phase === 'WAIT' || L.phase === 'B2' || L.phase === 'B1') && dt != null && dt <= 90000) {
-    if (isFinite(dB1) && dB1 > BEACON_REACHED_M) {
-      if (mem.phase !== 'B1') {
-        emitToUser(op.name, 'atc-instruction', { type: 'turn-to-B1', text: 'Vire hacia B1' });
-        lastInstr.set(op.name, { phase: 'B1', ts: now });
-        // sube de fase si venía en WAIT: está “en misión a B1”
-        if (L.phase === 'WAIT') setPhase(op.name, 'B1');
-      }
-      return;
+  // 3) Si está en FINAL y estamos cerca del slot y pista libre → CLRD
+  if (getApproachPhase(op.name) === 'FINAL' && dt != null && dt <= 45000 && !runwayState.inUse) {
+    if (mem.phase !== 'CLRD') {
+      const rwIdent = activeRunwayGeom()?.rw?.ident || '';
+      emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: rwIdent, text: 'Autorizado a aterrizar' });
+      lastInstr.set(op.name, { phase: 'CLRD', ts: now });
+      setApproachPhase(op.name, 'CLRD');
     }
+    return;
   }
 
-  // 3) Cleared-to-land (sólo si no está FINAL pero ya muy cerca del slot y B1 alcanzado)
-  if (dt != null && dt <= 45000 && !runwayState.inUse) {
-    if (isFinite(dB1) && dB1 <= BEACON_REACHED_M) {
-      if (mem.phase !== 'CLRD') {
-        const rwIdent = activeRunwayGeom()?.rw?.ident || '';
-        emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: rwIdent, text: 'Autorizado a aterrizar' });
-        lastInstr.set(op.name, { phase: 'CLRD', ts: now });
-      }
-      return;
-    }
-  }
+  // 4) Si está en FINAL pero aún falta, no retroceder a B1 nunca
+  //    (sin emisión; mantener silencio para evitar histeresis)
 }
+
+
 
 
 
@@ -1105,44 +1133,46 @@ socket.on('warning', (warningData) => {
   /* =====================  LISTENERS NUEVOS: RUNWAY  ===================== */
 
   // Solicitar aterrizaje o despegue / actualizar readiness
-  socket.on('runway-request', (msg) => {
-    try {
-      const { action, name, callsign, aircraft, type, emergency, altitude, ready } = msg || {};
-      if (!name || !action) return;
+// Solicitar aterrizaje o despegue / actualizar readiness
+socket.on('runway-request', (msg) => {
+  try {
+    const { action, name, callsign, aircraft, type, emergency, altitude, ready } = msg || {};
+    if (!name || !action) return;
 
-      if (action === 'land') {
-        if (!runwayState.landings.some(x => x.name === name)) {
-          runwayState.landings.push({
-            name, callsign, aircraft, type,
-            emergency: !!emergency,
-            altitude: typeof altitude === 'number' ? altitude : 999999,
-            requestedAt: new Date(),
-            phase: 'WAIT',
-            phaseTs: Date.now(),
-            lastAdvancementTs: Date.now(),
-            frozenLevel: 0,
-            committed: false,
-          });
-        }
-      } else if (action === 'takeoff') {
-        const idx = runwayState.takeoffs.findIndex(x => x.name === name);
-        if (idx === -1) {
-          runwayState.takeoffs.push({
-            name, callsign, aircraft, type,
-            ready: !!ready,
-            requestedAt: new Date()
-          });
-        } else {
-          runwayState.takeoffs[idx].ready = !!ready;
-        }
+    if (action === 'land') {
+      if (!runwayState.landings.some(x => x.name === name)) {
+        runwayState.landings.push({
+          name, callsign, aircraft, type,
+          emergency: !!emergency,
+          altitude: typeof altitude === 'number' ? altitude : 999999,
+          requestedAt: new Date()
+        });
       }
 
-      planRunwaySequence();
-      publishRunwayState();
-    } catch (e) {
-      console.error('runway-request error:', e);
+      // 🧭 Fase inicial explícita: al pedir aterrizaje arrancamos en TO_B2
+      // (no "retrocede" si ya está en una fase más avanzada)
+      try { setApproachPhase(name, 'TO_B2'); } catch {}
     }
-  });
+    else if (action === 'takeoff') {
+      const idx = runwayState.takeoffs.findIndex(x => x.name === name);
+      if (idx === -1) {
+        runwayState.takeoffs.push({
+          name, callsign, aircraft, type,
+          ready: !!ready,
+          requestedAt: new Date()
+        });
+      } else {
+        runwayState.takeoffs[idx].ready = !!ready;
+      }
+    }
+
+    planRunwaySequence();
+    publishRunwayState();
+  } catch (e) {
+    console.error('runway-request error:', e);
+  }
+});
+
 
   // Cancelar solicitud
   socket.on('runway-cancel', (msg) => {
@@ -1159,26 +1189,34 @@ socket.on('warning', (warningData) => {
   });
 
   // Marcar pista ocupada (cuando inicia final corta o rueda para despegar)
-  socket.on('runway-occupy', (msg) => {
-    try {
-      const { action, name, callsign, slotMin } = msg || {};
-      if (!action || !name) return;
-      if (!runwayState.inUse) {
-        runwayState.inUse = {
-          action,
-          name,
-          callsign: callsign || '',
-          startedAt: Date.now(),
-          slotMin: slotMin || (action === 'takeoff' ? TKOF_OCCUPY_MIN : MIN_LDG_SEP_MIN)
+socket.on('runway-occupy', (msg) => {
+  try {
+    const { action, name, callsign, slotMin } = msg || {};
+    if (!action || !name) return;
 
+    if (!runwayState.inUse) {
+      runwayState.inUse = {
+        action,
+        name,
+        callsign: callsign || '',
+        startedAt: Date.now(),
+        slotMin: slotMin || (action === 'takeoff' ? TKOF_OCCUPY_MIN : MIN_LDG_SEP_MIN)
+      };
 
-        };
-      }
-      publishRunwayState();
-    } catch (e) {
-      console.error('runway-occupy error:', e);
+      // 🔒 Al ocupar pista durante aterrizaje, el avión está en FINAL seguro
+      try {
+        if (action === 'landing' && name) {
+          setApproachPhase(name, 'FINAL');
+        }
+      } catch {}
     }
-  });
+
+    publishRunwayState();
+  } catch (e) {
+    console.error('runway-occupy error:', e);
+  }
+});
+
 
   // Liberar pista
   socket.on('runway-clear', () => {
@@ -1236,6 +1274,9 @@ socket.on('go-around', (msg = {}) => {
 
     planRunwaySequence();
     publishRunwayState();
+    // 🔁 Volver a fase de aproximación (no tan agresivo como TO_B2)
+    try { setApproachPhase(name, 'TO_B1'); } catch {}
+
   } catch (e) {
     console.error('go-around error:', e);
   }
