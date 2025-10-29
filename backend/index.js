@@ -342,12 +342,15 @@ function enforceCompliance() {
     const dB2 = getDistance(u.latitude, u.longitude, asg.b2.lat, asg.b2.lon);
 
     // Si estaba en FINAL pero se aleja demasiado de B1, pierde FINAL
-    if (L.phase === 'FINAL' && isFinite(dB1) && dB1 > FINAL_DRIFT_MAX_M) {
-      L.phase = 'WAIT';
-      L.frozenLevel = 0;
-      L.phaseTs = now;
-      L.committed = false;
-    }
+     //if (L.phase === 'FINAL' && isFinite(dB1) && dB1 > FINAL_DRIFT_MAX_M) {
+     //  L.phase = 'WAIT';
+     //  L.frozenLevel = 0;
+     //  L.phaseTs = now;
+     //  L.committed = false;
+    // }
+    // Evitar histéresis: NO degradar FINAL por alejarse de B1.
+// (Si querés una salvaguarda de go-around, hacelo por heading contrario + gran distancia.)
+
 
     // Si estaba en B2 y no progresa a B1 en el tiempo máximo, pierde el orden
     if (L.phase === 'B2') {
@@ -658,6 +661,11 @@ function maybeSendInstruction(opId, opsById) {
       // Cruzó B1: ya está en final (aunque no haya occupy)
       setApproachPhase(op.name, 'FINAL');
     }
+    // 🔒 Si entra al radio de freeze de B1, también pegamos FINAL (idempotente)
+    if (isFinite(dB1) && dB1 <= B1_FREEZE_RADIUS_M && getApproachPhase(op.name) !== 'CLRD') {
+      setApproachPhase(op.name, 'FINAL');
+    }
+
   } catch {}
 
   const cur = getApproachPhase(op.name);
