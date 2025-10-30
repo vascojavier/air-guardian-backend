@@ -678,6 +678,11 @@ function maybeSendInstruction(opId, opsById) {
   const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
   const mem = lastInstr.get(op.name) || { phase: null, ts: 0 };
 
+  // ⛓️ sticky actual del avión (para anti-histéresis)
+  const sticky = getLandingState(op.name); // 'ORD'|'B2'|'B1'|'FINAL'|'RUNWAY_CLEAR'|'IN_STANDS'
+  const stickyIsFinal = (sticky === 'FINAL' || sticky === 'RUNWAY_CLEAR' || sticky === 'IN_STANDS');
+  const stickyAtLeastB1 = (sticky === 'B1' || stickyIsFinal);
+
   // >>> Auto-advance de fase según proximidad a beacons <<<
   try {
     if (isFinite(dB2) && dB2 <= BEACON_REACHED_M && getApproachPhase(op.name) === 'TO_B2') {
@@ -691,7 +696,6 @@ function maybeSendInstruction(opId, opsById) {
     if (isFinite(dB1) && dB1 <= B1_FREEZE_RADIUS_M && getApproachPhase(op.name) !== 'CLRD') {
       setApproachPhase(op.name, 'FINAL');
     }
-
   } catch {}
 
   const cur = getApproachPhase(op.name);
@@ -700,8 +704,9 @@ function maybeSendInstruction(opId, opsById) {
   if (cur === 'CLRD') return;
 
   // 1) Si aún está en TO_B2 y está fuera de B2 → ordenar ir a B2
+  //    ❌ Nunca pedir B2 si ya se pidió B1 antes o si el sticky ya pasó B1.
   if (cur === 'TO_B2' && dB2 > BEACON_REACHED_M) {
-    if (mem.phase !== 'B2') {
+    if (mem.phase !== 'B2' && mem.phase !== 'B1' && !stickyAtLeastB1) {
       emitToUser(op.name, 'atc-instruction', {
         type: 'goto-beacon',
         beacon: 'B2',
@@ -715,22 +720,23 @@ function maybeSendInstruction(opId, opsById) {
   }
 
   // 2) Si está en TO_B1 (o auto-promovido desde B2) y falta para el slot → ventana de giro a B1
-  //    NUNCA ordenamos B1 si ya estás en FINAL (evita la histéresis).
+  //    ❌ Nunca pedir B1 si ya estás en FINAL/CLRD (FSM) o si el sticky es FINAL (o más).
   if ((cur === 'TO_B2' || cur === 'TO_B1') && dt != null && dt <= 90000 && dB1 > BEACON_REACHED_M) {
+    if (stickyIsFinal || cur === 'FINAL' || cur === 'CLRD') return;
+
     // Si todavía no promovimos a TO_B1, promové ya (lógica suave)
     if (cur === 'TO_B2') setApproachPhase(op.name, 'TO_B1');
 
-  if (getApproachPhase(op.name) === 'TO_B1' && mem.phase !== 'B1') {
-    emitToUser(op.name, 'atc-instruction', {
-      type: 'goto-beacon',
-      beacon: 'B1',
-      lat: asg.b1.lat,
-      lon: asg.b1.lon,
-      text: 'Proceda a B1'
-    });
-    lastInstr.set(op.name, { phase: 'B1', ts: now });
-  }
-
+    if (getApproachPhase(op.name) === 'TO_B1' && mem.phase !== 'B1') {
+      emitToUser(op.name, 'atc-instruction', {
+        type: 'goto-beacon',
+        beacon: 'B1',
+        lat: asg.b1.lat,
+        lon: asg.b1.lon,
+        text: 'Proceda a B1'
+      });
+      lastInstr.set(op.name, { phase: 'B1', ts: now });
+    }
     return;
   }
 
@@ -748,6 +754,7 @@ function maybeSendInstruction(opId, opsById) {
   // 4) Si está en FINAL pero aún falta, no retroceder a B1 nunca
   //    (sin emisión; mantener silencio para evitar histeresis)
 }
+
 
 
 
