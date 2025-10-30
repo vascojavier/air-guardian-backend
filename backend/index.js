@@ -669,7 +669,12 @@ function maybeSendInstruction(opId, opsById) {
   const u = userLocations[op.name];
   if (!u) return;
 
-  const phase = getApproachPhase(op.name); // 'TO_B2'|'TO_B1'|'FINAL'|'CLRD'
+  // FSM actual y sticky
+  const curPhase = getApproachPhase(op.name); // 'TO_B2'|'TO_B1'|'FINAL'|'CLRD'
+  const sticky = getLandingState(op.name);    // 'ORD','B2','B1','FINAL','RUNWAY_CLEAR','IN_STANDS'
+  const stickyReachedB1    = (sticky === 'B1' || sticky === 'FINAL' || sticky === 'RUNWAY_CLEAR' || sticky === 'IN_STANDS');
+  const stickyReachedFinal = (sticky === 'FINAL' || sticky === 'RUNWAY_CLEAR' || sticky === 'IN_STANDS');
+
   const mySlot = runwayState.timelineSlots.find(s => s.opId === opId);
   const now = Date.now();
   const dt = mySlot ? (mySlot.startMs - now) : null;
@@ -678,35 +683,30 @@ function maybeSendInstruction(opId, opsById) {
   const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
   const mem = lastInstr.get(op.name) || { phase: null, ts: 0 };
 
-  // ⛓️ sticky actual del avión (para anti-histéresis)
-  const sticky = getLandingState(op.name); // 'ORD'|'B2'|'B1'|'FINAL'|'RUNWAY_CLEAR'|'IN_STANDS'
-  const stickyIsFinal = (sticky === 'FINAL' || sticky === 'RUNWAY_CLEAR' || sticky === 'IN_STANDS');
-  const stickyAtLeastB1 = (sticky === 'B1' || stickyIsFinal);
-
-  // >>> Auto-advance de fase según proximidad a beacons <<<
+  // --- Auto-advance de fase por proximidad ---
   try {
-    if (isFinite(dB2) && dB2 <= BEACON_REACHED_M && getApproachPhase(op.name) === 'TO_B2') {
+    if (isFinite(dB2) && dB2 <= BEACON_REACHED_M && curPhase === 'TO_B2') {
       setApproachPhase(op.name, 'TO_B1');
+      setLandingStateForward(op.name, 'B2');
     }
     if (isFinite(dB1) && dB1 <= BEACON_REACHED_M && getApproachPhase(op.name) !== 'CLRD') {
-      // Cruzó B1: ya está en final (aunque no haya occupy)
       setApproachPhase(op.name, 'FINAL');
+      setLandingStateForward(op.name, 'B1'); // ya “pasó” por B1
     }
-    // 🔒 Si entra al radio de freeze de B1, también pegamos FINAL (idempotente)
     if (isFinite(dB1) && dB1 <= B1_FREEZE_RADIUS_M && getApproachPhase(op.name) !== 'CLRD') {
       setApproachPhase(op.name, 'FINAL');
+      setLandingStateForward(op.name, 'FINAL'); // congelado en final
     }
   } catch {}
 
-  const cur = getApproachPhase(op.name);
+  const phaseNow = getApproachPhase(op.name);
 
-  // 0) Si ya está CLRD, no emitir nada que retroceda
-  if (cur === 'CLRD') return;
+  // 0) Si ya está CLRD, nunca emitir algo que retroceda
+  if (phaseNow === 'CLRD') return;
 
-  // 1) Si aún está en TO_B2 y está fuera de B2 → ordenar ir a B2
-  //    ❌ Nunca pedir B2 si ya se pidió B1 antes o si el sticky ya pasó B1.
-  if (cur === 'TO_B2' && dB2 > BEACON_REACHED_M) {
-    if (mem.phase !== 'B2' && mem.phase !== 'B1' && !stickyAtLeastB1) {
+  // 1) Ir a B2 SOLO si aún estamos en TO_B2, no pedimos antes B1 y sticky < B1
+  if (phaseNow === 'TO_B2' && dB2 > BEACON_REACHED_M && !stickyReachedB1 && mem.phase !== 'B1') {
+    if (mem.phase !== 'B2') {
       emitToUser(op.name, 'atc-instruction', {
         type: 'goto-beacon',
         beacon: 'B2',
@@ -714,18 +714,17 @@ function maybeSendInstruction(opId, opsById) {
         text: 'Proceda a B2'
       });
       lastInstr.set(op.name, { phase: 'B2', ts: now });
-      // no cambiamos fase acá (sigue TO_B2) hasta “cruzar” B2
     }
     return;
   }
 
-  // 2) Si está en TO_B1 (o auto-promovido desde B2) y falta para el slot → ventana de giro a B1
-  //    ❌ Nunca pedir B1 si ya estás en FINAL/CLRD (FSM) o si el sticky es FINAL (o más).
-  if ((cur === 'TO_B2' || cur === 'TO_B1') && dt != null && dt <= 90000 && dB1 > BEACON_REACHED_M) {
-    if (stickyIsFinal || cur === 'FINAL' || cur === 'CLRD') return;
+  // 2) Ventana para B1, pero NUNCA si ya estás en FINAL/CLRD o sticky >= FINAL
+  if ((phaseNow === 'TO_B2' || phaseNow === 'TO_B1') &&
+      !stickyReachedFinal &&
+      dt != null && dt <= 90000 &&
+      dB1 > BEACON_REACHED_M) {
 
-    // Si todavía no promovimos a TO_B1, promové ya (lógica suave)
-    if (cur === 'TO_B2') setApproachPhase(op.name, 'TO_B1');
+    if (phaseNow === 'TO_B2') setApproachPhase(op.name, 'TO_B1');
 
     if (getApproachPhase(op.name) === 'TO_B1' && mem.phase !== 'B1') {
       emitToUser(op.name, 'atc-instruction', {
@@ -740,20 +739,21 @@ function maybeSendInstruction(opId, opsById) {
     return;
   }
 
-  // 3) Si está en FINAL y estamos cerca del slot y pista libre → CLRD
+  // 3) En FINAL, cerca del slot y pista libre → CLRD
   if (getApproachPhase(op.name) === 'FINAL' && dt != null && dt <= 45000 && !runwayState.inUse) {
     if (mem.phase !== 'CLRD') {
       const rwIdent = activeRunwayGeom()?.rw?.ident || '';
       emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: rwIdent, text: 'Autorizado a aterrizar' });
       lastInstr.set(op.name, { phase: 'CLRD', ts: now });
       setApproachPhase(op.name, 'CLRD');
+      setLandingStateForward(op.name, 'FINAL');
     }
     return;
   }
 
-  // 4) Si está en FINAL pero aún falta, no retroceder a B1 nunca
-  //    (sin emisión; mantener silencio para evitar histeresis)
+  // 4) En FINAL pero faltando tiempo → silencio. Nunca retroceder a B1.
 }
+
 
 
 
