@@ -57,6 +57,28 @@ function getDistance(lat1, lon1, lat2, lon2) {
   const PHASE_ORDER = ['TO_B2','TO_B1','FINAL','CLRD']; // orden estricto, no se retrocede
   const approachPhaseByName = new Map(); // name -> { phase: 'TO_B2'|'TO_B1'|'FINAL'|'CLRD', ts:number }
 
+  // ==== Estado sticky de ARR/DEP por avión (sin retrocesos) ====
+const LANDING_STATE_ORDER = ['ORD','B2','B1','FINAL','RUNWAY_CLEAR','IN_STANDS'];
+const landingStateByName = new Map(); // name -> { state: 'ORD'|..., ts:number }
+
+function getLandingState(name) {
+  return landingStateByName.get(name)?.state || 'ORD';
+}
+function setLandingStateForward(name, next) {
+  const cur = getLandingState(name);
+  const idxCur = LANDING_STATE_ORDER.indexOf(cur);
+  const idxNext = LANDING_STATE_ORDER.indexOf(next);
+  if (idxNext > idxCur) {
+    landingStateByName.set(name, { state: next, ts: Date.now() });
+    // console.log(`[LST] ${name}: ${cur} -> ${next}`);
+  }
+}
+// ⚠️ Sólo usar si querés “borrar” el estado (p.ej. go-around explícito)
+function resetLandingState(name, to='ORD') {
+  landingStateByName.set(name, { state: to, ts: Date.now() });
+}
+
+
   function getPhaseIdx(p){ return Math.max(0, PHASE_ORDER.indexOf(p)); }
   function getApproachPhase(name){
     return approachPhaseByName.get(name)?.phase || 'TO_B2';
@@ -315,6 +337,8 @@ function updateApproachPhase(name) {
       setPhase(name, 'B2');
       markAdvancement(name);
     }
+      // ➕ avance sticky (NO retrocede)
+      setLandingStateForward(name, 'B2');
   }
 
   // Llegó a B1
@@ -324,6 +348,8 @@ function updateApproachPhase(name) {
       markAdvancement(name);
       L.frozenLevel = 1;           // opcional: freeze al tocar B1
     }
+      // ➕ avance sticky (NO retrocede)
+      setLandingStateForward(name, 'B1');
   }
 
   // Commit dinámico
@@ -744,9 +770,13 @@ function publishRunwayState() {
       inUse: runwayState.inUse,
       timeline: timelineCompat,
       serverTime: now,
+          // ➕ mapa simple name->state para que la UI lo muestre si quiere
+      landingStates: Object.fromEntries(
+      Array.from(landingStateByName.entries()).map(([k, v]) => [k, v.state])
+    ),
     },
   });
-  
+
 
   // Secuencia “avanzada” + beacons para guiar
   const g = activeRunwayGeom();
@@ -1089,6 +1119,8 @@ socket.on('warning', (warningData) => {
       delete socketIdToName[socket.id];
       io.emit('user-removed', name);
       console.log(`❌ Usuario ${name} eliminado por leave`);
+          // 👇 limpiar estado sticky
+    landingStateByName.delete(name);
     }
 
     // ►► (AGREGADO) limpiar de colas si corresponde
@@ -1107,6 +1139,8 @@ socket.on('warning', (warningData) => {
       delete socketIdToName[socket.id];
       io.emit('user-removed', name);
       console.log(`❌ Usuario ${name} eliminado por desconexión`);
+          // 👇 limpiar estado sticky
+    landingStateByName.delete(name);
     }
 
     // ►► (AGREGADO) limpiar de colas si corresponde
@@ -1121,6 +1155,8 @@ socket.on('warning', (warningData) => {
     console.log(`🛑 Remove-user recibido para: ${name}`);
     if (userLocations[name]) {
       delete userLocations[name];
+          // 👇 limpiar estado sticky
+    landingStateByName.delete(name);
     }
     // Buscar socketId y eliminar de la tabla inversa
     for (const [sid, uname] of Object.entries(socketIdToName)) {
@@ -1131,6 +1167,7 @@ socket.on('warning', (warningData) => {
     }
     io.emit('user-removed', name);
     console.log(`❌ Usuario ${name} eliminado manualmente`);
+    
 
     // ►► (AGREGADO) limpiar de colas si corresponde
     runwayState.landings = runwayState.landings.filter(x => x.name !== name);
@@ -1157,6 +1194,10 @@ socket.on('runway-request', (msg) => {
           requestedAt: new Date()
         });
       }
+
+      // Estado inicial al entrar en cola (orden de aterrizaje)
+      resetLandingState(name, 'ORD');
+
 
       // 🧭 Fase inicial explícita: al pedir aterrizaje arrancamos en TO_B2
       // (no "retrocede" si ya está en una fase más avanzada)
@@ -1216,6 +1257,8 @@ socket.on('runway-occupy', (msg) => {
       try {
         if (action === 'landing' && name) {
           setApproachPhase(name, 'FINAL');
+          setLandingStateForward(name, 'FINAL');
+
         }
       } catch {}
     }
@@ -1227,16 +1270,25 @@ socket.on('runway-occupy', (msg) => {
 });
 
 
+  
   // Liberar pista
   socket.on('runway-clear', () => {
     try {
+      // ⚠️ Tomar el último antes de limpiar
+      const lastName = runwayState.inUse?.name;
+
       runwayState.inUse = null;
+
+      // El último que ocupó pista queda como RUNWAY_CLEAR
+      if (lastName) setLandingStateForward(lastName, 'RUNWAY_CLEAR');
+
       planRunwaySequence();
       publishRunwayState();
     } catch (e) {
       console.error('runway-clear error:', e);
     }
   });
+
 
   // Obtener estado de pista bajo demanda (al abrir el panel en Radar)
   socket.on('runway-get', () => {
@@ -1280,7 +1332,8 @@ socket.on('go-around', (msg = {}) => {
 
     // Aviso al piloto (UI/voz)
     emitToUser(name, 'runway-msg', { text: 'Arremetida registrada. Reingresando en secuencia.', key: 'go-around' });
-
+    // Reinicia a estado post-arremetida (vuelve a ordenar y luego a B1 cuando corresponda)
+    resetLandingState(name, 'ORD');
     planRunwaySequence();
     publishRunwayState();
     // 🔁 Volver a fase de aproximación (no tan agresivo como TO_B2)
@@ -1317,6 +1370,8 @@ app.delete('/api/location/:name', (req, res) => {
   const { name } = req.params;
   if (userLocations[name]) {
     delete userLocations[name];
+        // 👇 limpiar estado sticky
+    landingStateByName.delete(name);
     // limpiar también la tabla inversa si existiera
     for (const [sid, uname] of Object.entries(socketIdToName)) {
       if (uname === name) {
@@ -1347,6 +1402,8 @@ setInterval(() => {
       // avisar a todos
       io.emit('user-removed', name);
       console.log(`⏱️ Purga inactivo: ${name}`);
+          // 👇 limpiar estado sticky
+    landingStateByName.delete(name);
 
       // ►► (AGREGADO) también limpiar de colas y replanificar
       runwayState.landings = runwayState.landings.filter(x => x.name !== name);
