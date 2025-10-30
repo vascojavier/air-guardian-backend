@@ -53,44 +53,21 @@ function getDistance(lat1, lon1, lat2, lon2) {
   const lastInstrByName = {}; // { [name]: { type: 'goto-beacon'|'turn-to-B1'|'cleared-to-land', ts: number } }
 
 
-  // ==== Anti-histéresis por avión (FSM sticky por objetivos B2→B1→FINAL) ====
-  const PHASE_ORDER = ['TO_B2','TO_B1','FINAL','CLRD']; // solo se avanza
-  const approachPhaseByName = new Map(); 
-  // name -> { phase:'TO_B2'|'TO_B1'|'FINAL'|'CLRD', ts:number,
-  //           reached:{ B2:boolean, B1:boolean }, lastAdvancementTs:number }
+    // ==== Anti-histéresis por avión (FSM de aproximación) ====
+  const PHASE_ORDER = ['TO_B2','TO_B1','FINAL','CLRD']; // orden estricto, no se retrocede
+  const approachPhaseByName = new Map(); // name -> { phase: 'TO_B2'|'TO_B1'|'FINAL'|'CLRD', ts:number }
 
   function getPhaseIdx(p){ return Math.max(0, PHASE_ORDER.indexOf(p)); }
-
-  function ensurePhaseRecord(name){
-    let rec = approachPhaseByName.get(name);
-    if (!rec) {
-      rec = { phase: 'TO_B2', ts: 0, reached: { B2:false, B1:false }, lastAdvancementTs: 0 };
-      approachPhaseByName.set(name, rec);
-    }
-    return rec;
-  }
-
   function getApproachPhase(name){
-    return ensurePhaseRecord(name).phase;
+    return approachPhaseByName.get(name)?.phase || 'TO_B2';
   }
-
   function setApproachPhase(name, nextPhase){
-    const rec = ensurePhaseRecord(name);
-    if (getPhaseIdx(nextPhase) > getPhaseIdx(rec.phase)) {
-      rec.phase = nextPhase;
-      rec.ts = Date.now();
-      rec.lastAdvancementTs = rec.ts;
+    const cur = getApproachPhase(name);
+    if (getPhaseIdx(nextPhase) > getPhaseIdx(cur)) {
+      approachPhaseByName.set(name, { phase: nextPhase, ts: Date.now() });
+      // console.log(`[PHASE] ${name}: ${cur} -> ${nextPhase}`);
     }
   }
-
-  function markReached(name, which){ // which = 'B2' | 'B1'
-    const rec = ensurePhaseRecord(name);
-    if (!rec.reached[which]) {
-      rec.reached[which] = true;
-      rec.lastAdvancementTs = Date.now();
-    }
-  }
-
 
 
   // Beacons activos desde el airfield
@@ -325,56 +302,33 @@ function isCommitted(name) {
 function updateApproachPhase(name) {
   const L = getLandingByName(name);
   if (!L) return;
-
   const asg = assignBeaconsFor(name);
   const u = userLocations[name];
   if (!asg || !u) return;
 
-  const rec = ensurePhaseRecord(name);
-
   const dB2 = getDistance(u.latitude, u.longitude, asg.b2.lat, asg.b2.lon);
   const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
 
-  // Geofence de “llegada”: ajustá si querés (600–1000 m suelen ir bien)
-  const REACH_M = 800;
-
-  // Fase inicial: TO_B2 (idempotente)
-  if (rec.phase === 'TO_B2' || !PHASE_ORDER.includes(rec.phase)) {
-    // nada; el default ya es TO_B2
-  }
-
-  // Llegó a B2 → pasar a TO_B1 (solo una vez; sticky)
-  if (!rec.reached.B2 && isFinite(dB2) && dB2 <= REACH_M) {
-    markReached(name, 'B2');
-    setApproachPhase(name, 'TO_B1');
-  }
-
-  // Llegó a B1 → FINAL (solo una vez; sticky)
-  if (!rec.reached.B1 && isFinite(dB1) && dB1 <= REACH_M) {
-    markReached(name, 'B1');
-    setApproachPhase(name, 'FINAL');
-    L.frozenLevel = 1; // congelá turno al “tocar” B1
-  }
-
-  // “Commit” por cercanía / FINAL (no se degrada por alejarse => sin histéresis)
-  L.committed = isCommitted(name);
-
-  // Timeout: si se trabó en TO_B1 demasiado, resetea
-  if (rec.phase === 'TO_B1') {
-    const since = Date.now() - (rec.lastAdvancementTs || rec.ts || 0);
-    if (since > MAX_B2_TO_B1_S * 1000) {
-      // reset suave
-      rec.reached.B2 = false;
-      rec.reached.B1 = false;
-      rec.phase = 'TO_B2';
-      rec.ts = Date.now();
-      rec.lastAdvancementTs = rec.ts;
-      L.frozenLevel = 0;
-      L.committed = false;
+  // Llegó a B2
+  if (isFinite(dB2) && dB2 <= BEACON_REACHED_M) {
+    if (L.phase === 'WAIT') {
+      setPhase(name, 'B2');
+      markAdvancement(name);
     }
   }
-}
 
+  // Llegó a B1
+  if (isFinite(dB1) && dB1 <= BEACON_REACHED_M) {
+    if (L.phase !== 'FINAL') {
+      setPhase(name, 'FINAL');     // entra en final
+      markAdvancement(name);
+      L.frozenLevel = 1;           // opcional: freeze al tocar B1
+    }
+  }
+
+  // Commit dinámico
+  L.committed = isCommitted(name);
+}
 
 
 function enforceCompliance() {
@@ -689,81 +643,78 @@ function maybeSendInstruction(opId, opsById) {
   const u = userLocations[op.name];
   if (!u) return;
 
+  const phase = getApproachPhase(op.name); // 'TO_B2'|'TO_B1'|'FINAL'|'CLRD'
   const mySlot = runwayState.timelineSlots.find(s => s.opId === opId);
   const now = Date.now();
   const dt = mySlot ? (mySlot.startMs - now) : null;
 
   const dB2 = getDistance(u.latitude, u.longitude, asg.b2.lat, asg.b2.lon);
   const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
+  const mem = lastInstr.get(op.name) || { phase: null, ts: 0 };
 
-  // Auto-advance de fase (solo hacia adelante)
+  // >>> Auto-advance de fase según proximidad a beacons <<<
   try {
     if (isFinite(dB2) && dB2 <= BEACON_REACHED_M && getApproachPhase(op.name) === 'TO_B2') {
       setApproachPhase(op.name, 'TO_B1');
     }
     if (isFinite(dB1) && dB1 <= BEACON_REACHED_M && getApproachPhase(op.name) !== 'CLRD') {
+      // Cruzó B1: ya está en final (aunque no haya occupy)
       setApproachPhase(op.name, 'FINAL');
     }
+    // 🔒 Si entra al radio de freeze de B1, también pegamos FINAL (idempotente)
     if (isFinite(dB1) && dB1 <= B1_FREEZE_RADIUS_M && getApproachPhase(op.name) !== 'CLRD') {
       setApproachPhase(op.name, 'FINAL');
     }
+
   } catch {}
 
   const cur = getApproachPhase(op.name);
-  if (cur === 'CLRD') return; // no retroceder nunca
 
-  const mem = lastInstr.get(op.name) || { phase: null, ts: 0 };
+  // 0) Si ya está CLRD, no emitir nada que retroceda
+  if (cur === 'CLRD') return;
 
-  // 1) Aún no cruzó B2 → ordenar B2 con coords y nombre
-  if (cur === 'TO_B2' && (!isFinite(dB2) || dB2 > BEACON_REACHED_M)) {
+  // 1) Si aún está en TO_B2 y está fuera de B2 → ordenar ir a B2
+  if (cur === 'TO_B2' && dB2 > BEACON_REACHED_M) {
     if (mem.phase !== 'B2') {
       emitToUser(op.name, 'atc-instruction', {
         type: 'goto-beacon',
         beacon: 'B2',
-        lat: asg.b2.lat,
-        lon: asg.b2.lon,
+        lat: asg.b2.lat, lon: asg.b2.lon,
         text: 'Proceda a B2'
       });
       lastInstr.set(op.name, { phase: 'B2', ts: now });
+      // no cambiamos fase acá (sigue TO_B2) hasta “cruzar” B2
     }
     return;
   }
 
-  // 2) Ventana previa al slot → ordenar B1 (mismo formato)
-  if ((cur === 'TO_B2' || cur === 'TO_B1') && dt != null && dt <= 90000 && (!isFinite(dB1) || dB1 > BEACON_REACHED_M)) {
+  // 2) Si está en TO_B1 (o auto-promovido desde B2) y falta para el slot → ventana de giro a B1
+  //    NUNCA ordenamos B1 si ya estás en FINAL (evita la histéresis).
+  if ((cur === 'TO_B2' || cur === 'TO_B1') && dt != null && dt <= 90000 && dB1 > BEACON_REACHED_M) {
+    // Si todavía no promovimos a TO_B1, promové ya (lógica suave)
     if (cur === 'TO_B2') setApproachPhase(op.name, 'TO_B1');
+
     if (getApproachPhase(op.name) === 'TO_B1' && mem.phase !== 'B1') {
-      emitToUser(op.name, 'atc-instruction', {
-        type: 'goto-beacon',
-        beacon: 'B1',
-        lat: asg.b1.lat,
-        lon: asg.b1.lon,
-        text: 'Proceda a B1'
-      });
+      emitToUser(op.name, 'atc-instruction', { type: 'turn-to-B1', text: 'Vire hacia B1' });
       lastInstr.set(op.name, { phase: 'B1', ts: now });
     }
     return;
   }
 
-  // 3) En FINAL y cerca del slot con pista libre → autorización
+  // 3) Si está en FINAL y estamos cerca del slot y pista libre → CLRD
   if (getApproachPhase(op.name) === 'FINAL' && dt != null && dt <= 45000 && !runwayState.inUse) {
     if (mem.phase !== 'CLRD') {
       const rwIdent = activeRunwayGeom()?.rw?.ident || '';
-      emitToUser(op.name, 'atc-instruction', {
-        type: 'cleared-to-land',
-        rwy: rwIdent,
-        text: 'Autorizado a aterrizar'
-      });
+      emitToUser(op.name, 'atc-instruction', { type: 'cleared-to-land', rwy: rwIdent, text: 'Autorizado a aterrizar' });
       lastInstr.set(op.name, { phase: 'CLRD', ts: now });
       setApproachPhase(op.name, 'CLRD');
     }
     return;
   }
 
-  // 4) En FINAL pero falta: silencio (no retroceder a B1)
+  // 4) Si está en FINAL pero aún falta, no retroceder a B1 nunca
+  //    (sin emisión; mantener silencio para evitar histeresis)
 }
-
-
 
 
 
@@ -793,9 +744,9 @@ function publishRunwayState() {
       inUse: runwayState.inUse,
       timeline: timelineCompat,
       serverTime: now,
-      stickyPhase: getApproachPhase(l.name)
     },
   });
+  
 
   // Secuencia “avanzada” + beacons para guiar
   const g = activeRunwayGeom();
