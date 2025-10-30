@@ -720,10 +720,17 @@ function maybeSendInstruction(opId, opsById) {
     // Si todavía no promovimos a TO_B1, promové ya (lógica suave)
     if (cur === 'TO_B2') setApproachPhase(op.name, 'TO_B1');
 
-    if (getApproachPhase(op.name) === 'TO_B1' && mem.phase !== 'B1') {
-      emitToUser(op.name, 'atc-instruction', { type: 'turn-to-B1', text: 'Vire hacia B1' });
-      lastInstr.set(op.name, { phase: 'B1', ts: now });
-    }
+  if (getApproachPhase(op.name) === 'TO_B1' && mem.phase !== 'B1') {
+    emitToUser(op.name, 'atc-instruction', {
+      type: 'goto-beacon',
+      beacon: 'B1',
+      lat: asg.b1.lat,
+      lon: asg.b1.lon,
+      text: 'Proceda a B1'
+    });
+    lastInstr.set(op.name, { phase: 'B1', ts: now });
+  }
+
     return;
   }
 
