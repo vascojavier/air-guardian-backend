@@ -21,6 +21,10 @@ import { Airfield } from '../types/airfield';
 import * as Speech from 'expo-speech';
 
 
+type OpsState =
+  | 'APRON_STOP' | 'TAXI_APRON' | 'TAXI_TO_RWY' | 'HOLD_SHORT'
+  | 'RUNWAY_OCCUPIED' | 'RUNWAY_CLEAR' | 'AIRBORNE'
+  | 'LAND_QUEUE' | 'B2' | 'B1' | 'FINAL';
 
 
 
@@ -236,6 +240,10 @@ const serverATCRef = useRef(false);
 // Candado de turno cuando paso por B1 (FINAL)
 // Se suelta solo si el líder es EMERGENCIA
 const finalLockedRef = useRef(false);
+const lastOpsStateRef = useRef<OpsState | null>(null);
+const lastOpsStateTsRef = useRef<number>(0);
+const OPS_DWELL_MS = 4000; // permanecer 4s antes de anunciar cambio
+
 
 
 
@@ -247,6 +255,11 @@ const [airfield, setAirfield] = useState<Airfield | null>(null);
 const rw = airfield?.runways?.[0];
 const A_runway = rw ? { latitude: rw.thresholdA.lat, longitude: rw.thresholdA.lng } : null;
 const B_runway = rw ? { latitude: rw.thresholdB.lat, longitude: rw.thresholdB.lng } : null;
+const activeIdent = useMemo<string | null>(() => {
+  if (!rw) return null;
+  return rw.active_end === 'B' ? (rw.identB ?? null) : (rw.identA ?? null);
+}, [rw]);
+
 const runwayHeading = rw
   ? (rw.active_end === 'A' ? rw.heading_true_ab : (rw.heading_true_ab + 180) % 360)
   : 0;
@@ -351,6 +364,8 @@ function avgApproachSpeedMps(speedKmh: number, type?: string) {
   return (avgKmh * 1000) / 3600;
 }
 
+
+
 // distancia punto–segmento (m) para saber si estás sobre la pista (eje)
 function distancePointToSegmentM(
   p:{lat:number;lon:number},
@@ -382,6 +397,18 @@ function isNearThreshold(end:'A'|'B', radiusM=60): boolean {
   if (!thr) return false;
   return getDistance(myPlane.lat, myPlane.lon, thr.latitude, thr.longitude) <= radiusM;
 }
+
+function getAGLmeters(): number {
+  const elev = (airfield as any)?.elevation ?? (runwayState?.airfield?.elevation ?? 0);
+  const altMSL = myPlane?.alt ?? 0;
+  return Math.max(0, altMSL - elev);
+}
+
+function isStopped(): boolean {
+  // velocidad del estado está en km/h
+  return (myPlane?.speed ?? 0) < 5; // <5 km/h = detenido
+}
+
 
 // ETA a la cabecera activa (segundos), con penalidad por medio giro si venís por la opuesta
 function etaToActiveThresholdSec(): number | null {
@@ -1062,10 +1089,7 @@ s.on('conflicto', (data: any) => {
     setPrioritizedWarning(prev => (prev && prev.id === id) ? null : prev);
   });
 
-  // (sigue el resto)
-  s.on('traffic-update', (data: any) => {
-    // ...
-  });
+
 
 
     s.on('traffic-update', (data: any) => {
@@ -1285,8 +1309,89 @@ s.on('conflicto', (data: any) => {
     // 🔹 refrescar la distancia en vivo del warning “pinneado”
     refreshPinnedDistance();
 
+      // ==== OPS STATE EMITTER (front = fuente de verdad) ====
+  (() => {
+    const now = Date.now();
+
+    // Señales de contexto
+    const agl = getAGLmeters();              // m sobre aeródromo
+    const onRunway = isOnRunwayStrip();      // eje pista ±40 m
+    const activeEnd = rw?.active_end === 'B' ? 'B' : 'A';
+    const nearHold = isNearThreshold(activeEnd as 'A'|'B', 100); // 100 m cabecera activa
+    const stopped  = isStopped();
+    const speedKmh = myPlane?.speed ?? 0;
+
+    // Estados sticky de aproximación que ya tenés en front
+    const inFinalLock = finalLockedRef.current === true;
+
+    // Candidatos (prioridad por “más específicos” primero)
+    let next: OpsState | null = null;
+
+    if (onRunway && agl < 10) {
+      next = 'RUNWAY_OCCUPIED';
+    } else if (nearHold && agl < 20 && speedKmh < 35 && !onRunway) {
+      next = 'HOLD_SHORT';
+    } else if (agl > 50) {
+      next = inFinalLock ? 'FINAL' : 'AIRBORNE';
+    } else if (stopped && !onRunway) {
+      next = 'APRON_STOP';
+    } else if (!onRunway && agl < 30 && speedKmh >= 35) {
+      next = nearHold ? 'TAXI_TO_RWY' : 'TAXI_APRON';
+    } else if (!onRunway && agl < 30 && speedKmh >= 5) {
+      next = 'TAXI_APRON';
+    } else if (!onRunway && agl < 30 && speedKmh < 5) {
+      next = 'RUNWAY_CLEAR';
+    }
+
+    // Estados de aproximación si pediste aterrizaje (opcional, conservamos sticky)
+    if (!next && landingRequestedRef.current) {
+      const me = myPlane?.id || username;
+      const idx = (runwayState?.state?.landings || []).findIndex((x:any)=>x?.name===me);
+      if (idx > 0) next = 'LAND_QUEUE';
+      else if (inFinalLock) next = 'FINAL';
+      else {
+        if (beaconB1 && getDistance(myPlane.lat, myPlane.lon, beaconB1.latitude, beaconB1.longitude) < 800) next = 'B1';
+        else if (beaconB2 && getDistance(myPlane.lat, myPlane.lon, beaconB2.latitude, beaconB2.longitude) < 800) next = 'B2';
+      }
+    }
+
+    if (!next) return;
+
+    // Dwell 4s
+    const last = lastOpsStateRef.current;
+    if (last !== next) {
+      if (now - lastOpsStateTsRef.current < OPS_DWELL_MS) return;
+    }
+
+    // Cambió (o confirmó) estado → emitimos
+    if (last !== next) {
+      lastOpsStateRef.current = next;
+      lastOpsStateTsRef.current = now;
+
+      socketRef.current?.emit('ops/state', {
+        name: username,
+        state: next,
+        aux: {
+          // ⬇️ Compatibles con tus tipos (sin 'ident' inexistentes):
+          airportId: (airfield as any)?.icao || (airfield as any)?.id || (airfield as any)?.name || '',
+          rwyIdent: activeIdent ?? (rw?.identA ?? rw?.identB ?? ''),
+          aglM: agl,
+          onRunway,
+          nearHoldShort: nearHold,
+        }
+      });
+
+      console.log('[OPS] Emitted', next);
+    }
+  })();
+
+    
+
     // 👇👇 FALTABA cerrar el setInterval
     }, 1000);
+
+
+    
 
     // 👇👇 Y el cleanup + cierre del useEffect
     return () => {
@@ -1627,98 +1732,99 @@ if (firstLanding?.name === me && !st.inUse && defaultActionForMe() === 'land') {
     if (!rw || !beaconB1 || !beaconB2) { setNavTarget(null); return; }
     // Sólo guiamos si pediste aterrizaje y estás “volando”
 
-// Sólo guiamos si pediste aterrizaje y estás “volando”
-if (!landingRequestedRef.current || defaultActionForMe() !== 'land') {
-  setNavTarget(null);
-  // reset de máquina cuando dejo de necesitar guía
-  navPhaseRef.current = null;
-  prevIdxRef.current = null;
-  return;
-}
-
-const me = myPlane?.id || username;
-const landings = runwayState?.state?.landings || [];
-let idx = landings.findIndex((x:any) => x?.name === me);
-if (idx === -1) { setNavTarget(null); return; }
-
-// ⬇️ NUEVO: si tengo candado (ya pasé B1 → FINAL), fuerzo mi idx a 0,
-// salvo que el líder real sea EMERGENCIA (entonces cedo).
-if (finalLockedRef.current) {
-  const leader = landings[0];
-  const leaderIsEmergency = !!leader?.emergency;
-  if (!leaderIsEmergency || leader?.name === me) {
-    idx = 0; // me mantengo #1 aunque el server reordene por ETA
-  } else {
-    // Cede solo ante emergencia adelantada
-    finalLockedRef.current = false; // suelto candado si me pasaron por emergencia
-  }
-}
-
-
-// 👉 Reinicio suave cuando paso de #>0 a #0 (habilita cambio inmediato de fase)
-if (prevIdxRef.current != null && prevIdxRef.current > 0 && idx === 0) {
-  lastPhaseSwitchRef.current = 0;     // quita “dwell” mínimo
-  navPhaseRef.current = null;         // re-evaluo fase inicial como #1
-}
-prevIdxRef.current = idx;
-
-// === Modo #>0 → B2 (sin spam)
-if (idx > 0) {
-  if (navPhaseRef.current !== 'B2') {
-    if (maybeSwitchPhase('B2')) {
-      setNavTarget(beaconB2);
-      flashBanner('Proceda a B2', 'goto-b2');
-      try { Speech.stop(); Speech.speak('Proceda a be dos', { language: 'es-ES' }); } catch {}
+    // Sólo guiamos si pediste aterrizaje y estás “volando”
+    if (!landingRequestedRef.current || defaultActionForMe() !== 'land') {
+      setNavTarget(null);
+      // reset de máquina cuando dejo de necesitar guía
+      navPhaseRef.current = null;
+      prevIdxRef.current = null;
+      return;
     }
-  } else {
-    // mantener B2 sin repetir banner/voz
-    if (!navTarget || navTarget.latitude !== beaconB2.latitude || navTarget.longitude !== beaconB2.longitude) {
-      setNavTarget(beaconB2);
+
+    const me = myPlane?.id || username;
+    const landings = runwayState?.state?.landings || [];
+    let idx = landings.findIndex((x:any) => x?.name === me);
+    if (idx === -1) { setNavTarget(null); return; }
+
+    // ⬇️ NUEVO: si tengo candado (ya pasé B1 → FINAL), fuerzo mi idx a 0,
+    // salvo que el líder real sea EMERGENCIA (entonces cedo).
+    if (finalLockedRef.current) {
+      const leader = landings[0];
+      const leaderIsEmergency = !!leader?.emergency;
+      if (!leaderIsEmergency || leader?.name === me) {
+        idx = 0; // me mantengo #1 aunque el server reordene por ETA
+      } else {
+        // Cede solo ante emergencia adelantada
+        finalLockedRef.current = false; // suelto candado si me pasaron por emergencia
+      }
     }
-  }
-  return;
-}
-
-// === Soy #1 — histéresis + dwell
-const dToB1 = getDistance(myPlane.lat, myPlane.lon, beaconB1.latitude, beaconB1.longitude);
-
-// Fase inicial por proximidad si aún no hay fase
-if (!navPhaseRef.current) {
-  navPhaseRef.current = dToB1 > B1_ENTER_M ? 'B1' : 'FINAL';
-  lastPhaseSwitchRef.current = Date.now();
-}
-
-if (dToB1 <= FINAL_ENTER_M && maybeSwitchPhase('FINAL')) {
-  // ⬇️ NUEVO: candado local + freeze al server
-  finalLockedRef.current = true;
-  socketRef.current?.emit('sequence-freeze', { name: me, reason: 'locked-at-B1' });
-
-  if (activeThreshold) {
-    setNavTarget(activeThreshold);
-    flashBanner('Continúe a final', 'continue-final');
-    try { Speech.stop(); Speech.speak('Continúe a final', { language: 'es-ES' }); } catch {}
-  }
-}
 
 
-// B1 → FINAL si entro por debajo de FINAL_ENTER_M (banner/voz SOLO al cambiar)
-if (navPhaseRef.current === 'B1') {
-  if (dToB1 <= FINAL_ENTER_M) {
-    if (maybeSwitchPhase('FINAL') && activeThreshold) {
-      setNavTarget(activeThreshold);
-      flashBanner('Continúe a final', 'continue-final');
-      try { Speech.stop(); Speech.speak('Continúe a final', { language: 'es-ES' }); } catch {}
+    // 👉 Reinicio suave cuando paso de #>0 a #0 (habilita cambio inmediato de fase)
+    if (prevIdxRef.current != null && prevIdxRef.current > 0 && idx === 0) {
+      lastPhaseSwitchRef.current = 0;     // quita “dwell” mínimo
+      navPhaseRef.current = null;         // re-evaluo fase inicial como #1
     }
-  } else {
-    // Mantener B1 sin re-banners
-    if (!navTarget || navTarget.latitude !== beaconB1.latitude || navTarget.longitude !== beaconB1.longitude) {
-      setNavTarget(beaconB1);
-      // 👇 IMPORTANTE: no volver a llamar flashBanner/voz aquí
+    prevIdxRef.current = idx;
+
+    // === Modo #>0 → B2 (sin spam)
+    if (idx > 0) {
+      if (navPhaseRef.current !== 'B2') {
+        if (maybeSwitchPhase('B2')) {
+          setNavTarget(beaconB2);
+          flashBanner('Proceda a B2', 'goto-b2');
+          try { Speech.stop(); Speech.speak('Proceda a be dos', { language: 'es-ES' }); } catch {}
+        }
+      } else {
+        // mantener B2 sin repetir banner/voz
+        if (!navTarget || navTarget.latitude !== beaconB2.latitude || navTarget.longitude !== beaconB2.longitude) {
+          setNavTarget(beaconB2);
+        }
+      }
+      return;
     }
-  }
+
+    // === Soy #1 — histéresis + dwell
+    const dToB1 = getDistance(myPlane.lat, myPlane.lon, beaconB1.latitude, beaconB1.longitude);
+
+    // Fase inicial por proximidad si aún no hay fase
+    if (!navPhaseRef.current) {
+      navPhaseRef.current = dToB1 > B1_ENTER_M ? 'B1' : 'FINAL';
+      lastPhaseSwitchRef.current = Date.now();
+    }
+
+    if (dToB1 <= FINAL_ENTER_M && maybeSwitchPhase('FINAL')) {
+      // ⬇️ NUEVO: candado local + freeze al server
+      finalLockedRef.current = true;
+      socketRef.current?.emit('sequence-freeze', { name: me, reason: 'locked-at-B1' });
+
+      if (activeThreshold) {
+        setNavTarget(activeThreshold);
+        flashBanner('Continúe a final', 'continue-final');
+        try { Speech.stop(); Speech.speak('Continúe a final', { language: 'es-ES' }); } catch {}
+      }
+    }
+
+
+    // B1 → FINAL si entro por debajo de FINAL_ENTER_M (banner/voz SOLO al cambiar)
+    if (navPhaseRef.current === 'B1') {
+      if (dToB1 <= FINAL_ENTER_M) {
+        if (maybeSwitchPhase('FINAL') && activeThreshold) {
+          setNavTarget(activeThreshold);
+          flashBanner('Continúe a final', 'continue-final');
+          try { Speech.stop(); Speech.speak('Continúe a final', { language: 'es-ES' }); } catch {}
+        }
+      } else {
+        // Mantener B1 sin re-banners
+        if (!navTarget || navTarget.latitude !== beaconB1.latitude || navTarget.longitude !== beaconB1.longitude) {
+          setNavTarget(beaconB1);
+          // 👇 IMPORTANTE: no volver a llamar flashBanner/voz aquí
+        }
+      }
 } else {
-  // FINAL → B1 solo si me alejo por encima de B1_EXIT_M (banner/voz SOLO al cambiar)
-  if (dToB1 >= B1_EXIT_M) {
+  // FINAL → (posible) B1: solo si NO está candado y realmente te abriste bastante
+  // Evita histéresis tras “Continúe a final”.
+  if (!finalLockedRef.current && dToB1 >= B1_ENTER_M) {
     if (maybeSwitchPhase('B1')) {
       setNavTarget(beaconB1);
       flashBanner('Vire hacia B1', 'turn-b1');
@@ -1731,6 +1837,7 @@ if (navPhaseRef.current === 'B1') {
     }
   }
 }
+
 
 
   }, [
@@ -2024,26 +2131,38 @@ if (navPhaseRef.current === 'B1') {
       backgroundColor:'#fff', borderRadius:14, padding:12, elevation:4
     }}>
 
-    {/* Turno propio en rojo (usa la cola donde REALMENTE estoy) */}
-    <Text style={{color:'#C62828', fontWeight:'700', marginBottom:6}}>
-      {(() => {
-        const me = myPlane?.id || username;
-        const ls = runwayState?.state?.landings || [];
-        const ts = runwayState?.state?.takeoffs || [];
+  {/* Turno propio en rojo (usa la cola donde REALMENTE estoy) */}
+  <Text style={{color:'#C62828', fontWeight:'700', marginBottom:6}}>
+    {(() => {
+      const me = myPlane?.id || username;
+      const ls = runwayState?.state?.landings || [];
+      const ts = runwayState?.state?.takeoffs || [];
 
-        const iL = ls.findIndex((x:any)=>x?.name===me);
-        const iT = ts.findIndex((x:any)=>x?.name===me);
+      const iL = ls.findIndex((x:any)=>x?.name===me);
+      const iT = ts.findIndex((x:any)=>x?.name===me);
 
-        // si estoy en alguna cola, usar esa; si no, caer a defaultActionForMe()
-        const activeList =
-          iL >= 0 ? ls :
-          iT >= 0 ? ts :
-          (defaultActionForMe()==='land' ? ls : ts);
+      const activeList =
+        iL >= 0 ? ls :
+        iT >= 0 ? ts :
+        (defaultActionForMe()==='land' ? ls : ts);
 
-        const idx = activeList.findIndex((x:any)=>x?.name===me);
-        return idx >= 0 ? `Turno #${idx+1}` : 'Sin turno asignado';
-      })()}
-    </Text>
+      const idx = activeList.findIndex((x:any)=>x?.name===me);
+
+      // 🔒 Ocultar "Turno #" si estoy bloqueado en FINAL/B1 o estoy ocupando pista, o si la pista está en uso
+      const stNow = lastOpsStateRef.current;
+      const hideTurno =
+        finalLockedRef.current ||
+        stNow === 'FINAL' || stNow === 'B1' || stNow === 'RUNWAY_OCCUPIED' ||
+        !!runwayState?.state?.inUse;
+
+      return (idx >= 0 && !hideTurno) ? `Turno #${idx+1}` : ' ';
+    })()}
+  </Text>
+  {/* Estado OPS visible aparte */}
+  <Text style={{fontSize:12, marginTop:4}}>
+    Estado OPS: {lastOpsStateRef.current ?? '—'}
+  </Text>
+
 
 
     {/* Quién está en uso */}
