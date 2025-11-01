@@ -61,6 +61,18 @@ function getDistance(lat1, lon1, lat2, lon2) {
 const LANDING_STATE_ORDER = ['ORD','B2','B1','FINAL','RUNWAY_CLEAR','IN_STANDS'];
 const landingStateByName = new Map(); // name -> { state: 'ORD'|..., ts:number }
 
+  // === OpsState (estado operativo reportado por el front) ===
+  // Valores esperados (frontend): 
+  // 'APRON_STOP' | 'TAXI_APRON' | 'TAXI_TO_RWY' | 'HOLD_SHORT' |
+  // 'RUNWAY_OCCUPIED' | 'RUNWAY_CLEAR' | 'AIRBORNE' |
+  // 'LAND_QUEUE' | 'B2' | 'B1' | 'FINAL'
+  const opsStateByName = new Map(); // name -> { state: string, ts: number, aux?: object }
+
+  function getOpsState(name) {
+    return opsStateByName.get(name)?.state || null;
+  }
+
+
 function getLandingState(name) {
   return landingStateByName.get(name)?.state || 'ORD';
 }
@@ -309,6 +321,10 @@ function markAdvancement(name) {
 // Determina si ya no debe reordenarse (comprometido a final)
 function isCommitted(name) {
   const L = getLandingByName(name);
+    // Si el front reporta FINAL o B1, consideramos comprometido
+  const curOps = getOpsState(name);
+  if (curOps === 'FINAL' || curOps === 'B1') return true;
+
   if (!L) return false;
   if (L.frozenLevel === 1) return true;
   if (L.phase === 'B1' || L.phase === 'FINAL') return true;
@@ -683,6 +699,18 @@ function maybeSendInstruction(opId, opsById) {
   const dB1 = getDistance(u.latitude, u.longitude, asg.b1.lat, asg.b1.lon);
   const mem = lastInstr.get(op.name) || { phase: null, ts: 0 };
 
+      // 🚦 Guardas por estado operativo reportado (front es la fuente de verdad)
+    const curOps = getOpsState(op.name);
+    // Nunca pedir B1/B2 si ya está en FINAL, en pista, liberando pista o en stands
+    if (curOps === 'FINAL' || curOps === 'RUNWAY_OCCUPIED' || curOps === 'RUNWAY_CLEAR' || curOps === 'APRON_STOP') {
+      return;
+    }
+    // Nunca pedir B2 si ya pasó por B1
+    if (curOps === 'B1') {
+      return;
+    }
+
+
   // --- Auto-advance de fase por proximidad ---
   try {
     if (isFinite(dB2) && dB2 <= BEACON_REACHED_M && curPhase === 'TO_B2') {
@@ -779,14 +807,19 @@ function publishRunwayState() {
   io.emit('runway-state', {
     airfield,
     state: {
+       // ➕ mapa simple name->opsState (reportado por frontend)
+      opsStates: Object.fromEntries(
+        Array.from(opsStateByName.entries()).map(([k, v]) => [k, v.state])
+      ),
       landings: runwayState.landings,
       takeoffs: runwayState.takeoffs,
       inUse: runwayState.inUse,
       timeline: timelineCompat,
       serverTime: now,
-          // ➕ mapa simple name->state para que la UI lo muestre si quiere
+       // ➕ mapa simple name->state para que la UI lo muestre si quiere
       landingStates: Object.fromEntries(
       Array.from(landingStateByName.entries()).map(([k, v]) => [k, v.state])
+      
     ),
     },
   });
@@ -864,16 +897,26 @@ function cleanupInUseIfDone() {
   const oldLand = runwayState.lastOrder.landings || [];
   const oldTk   = runwayState.lastOrder.takeoffs || [];
 
-  newLand.forEach((name, idx) => {
-    if (oldLand.indexOf(name) !== idx) {
-      emitToUser(name, 'runway-msg', { text: `Su turno de aterrizaje ahora es #${idx+1}`, key: 'turn-land' });
-    }
-  });
-  newTk.forEach((name, idx) => {
-    if (oldTk.indexOf(name) !== idx) {
-      emitToUser(name, 'runway-msg', { text: `Su turno de despegue ahora es #${idx+1}`, key: 'turn-tk' });
-    }
-  });
+    newLand.forEach((name, idx) => {
+      if (oldLand.indexOf(name) !== idx) {
+        const st = getOpsState(name);
+        const allowTurnMsg = !(st === 'FINAL' || st === 'RUNWAY_OCCUPIED' || st === 'RUNWAY_CLEAR' || st === 'APRON_STOP');
+        if (allowTurnMsg) {
+          emitToUser(name, 'runway-msg', { text: `Su turno de aterrizaje ahora es #${idx+1}`, key: 'turn-land' });
+        }
+      }
+    });
+
+    newTk.forEach((name, idx) => {
+      if (oldTk.indexOf(name) !== idx) {
+        const st2 = getOpsState(name);
+        const allowTkMsg = !(st2 === 'RUNWAY_OCCUPIED' || st2 === 'RUNWAY_CLEAR' || st2 === 'APRON_STOP');
+        if (allowTkMsg) {
+          emitToUser(name, 'runway-msg', { text: `Su turno de despegue ahora es #${idx+1}`, key: 'turn-tk' });
+        }
+      }
+    });
+
   runwayState.lastOrder.landings = newLand;
   runwayState.lastOrder.takeoffs = newTk;
 
@@ -985,6 +1028,41 @@ io.on('connection', (socket) => {
       publishRunwayState();
     }
  });
+
+   // === Estado operativo reportado por el frontend ===
+  socket.on('ops/state', (msg) => {
+    try {
+      const { name, state, aux } = msg || {};
+      if (!name || !state) return;
+      opsStateByName.set(name, { state, ts: Date.now(), aux });
+
+      // ▸ Ajustes suaves al scheduler según estado
+      // Si está ocupando pista, marcamos inUse (fallback por si front no llamó runway-occupy)
+      if (state === 'RUNWAY_OCCUPIED' && !runwayState.inUse) {
+        runwayState.inUse = { action: 'landing', name, callsign: userLocations[name]?.callsign || '', startedAt: Date.now(), slotMin: MIN_LDG_SEP_MIN };
+      }
+
+      // Si liberó pista, limpiamos inUse si era él
+      if (state === 'RUNWAY_CLEAR' && runwayState.inUse?.name === name) {
+        runwayState.inUse = null;
+      }
+
+      // Congelar reorden al tocar B1/FINAL
+      if (state === 'B1' || state === 'FINAL') {
+        const L = runwayState.landings.find(l => l.name === name);
+        if (L) L.frozenLevel = 1;
+      }
+
+      // Replanificar/publicar con el nuevo estado
+      if (runwayState.landings.length || runwayState.takeoffs.length) {
+        planRunwaySequence();
+      }
+      publishRunwayState();
+    } catch (e) {
+      console.error('ops/state error:', e);
+    }
+  });
+
 
   socket.on('get-traffic', () => {
     // (3) Normalizar a lat/lon en initial-traffic
